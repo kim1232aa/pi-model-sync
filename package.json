@@ -1,0 +1,18 @@
+{
+  "name": "pi-model-sync",
+  "version": "1.0.0",
+  "description": "Generic model catalog sync for pi: discover models and match their capabilities for any provider that declares a baseUrl in models.json.",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "pi-extension",
+    "models",
+    "model-catalog"
+  ],
+  "license": "MIT",
+  "pi": {
+    "extensions": [
+      "./extensions"
+    ]
+  }
+}
