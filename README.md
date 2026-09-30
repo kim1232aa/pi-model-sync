@@ -117,12 +117,32 @@ Optional, `<provider>-overrides.json` next to `models.json`:
 
 ## Notes
 
+- If `models.json` cannot be parsed, the sync aborts and writes nothing. Comments in
+  `models.json` are accepted but are not preserved when the file is rewritten.
+- Writes are atomic (temp file + rename).
+- `headers` values support the same `$ENV` / `!command` syntax as `apiKey`.
 - `models.json` is strictly validated by pi. This extension only ever writes
   fields pi knows (`id`, `name`, `reasoning`, `thinkingLevelMap`, `input`,
   `cost`, `contextWindow`, `maxTokens`, `compat`).
 - A successful sync replaces the provider's model list, so models that no longer
   exist upstream are removed.
 - models.dev data is cached for 6 hours per process.
+
+## Development
+
+```bash
+npm test
+```
+
+## Similar projects
+
+- [better-custom-provider](https://github.com/real-wudaoshi/better-custom) — interactive TUI wizard to add/re-probe providers.
+- [@indexyz/pi-custom-provider](https://github.com/5aaee9/pi-agent-extensions) — registers providers at runtime from its own `custom-provider.json`.
+- [@palmtom/pi-models](https://github.com/palmtom316/pi-models) — TUI wizard that writes `models.json`.
+- [pi-autofill-model-metadata](https://github.com/peach0x33a/pi-extensions) — explicit per-model models.dev mapping, runtime only.
+
+This package is the non-interactive option: one command, works in pi-web, no
+extra config file, and reads the gateway's own capability fields first.
 
 ## License
 

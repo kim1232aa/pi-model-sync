@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { readFile, writeFile } from "node:fs/promises";
+import { readFile, rename, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -39,7 +39,7 @@ const REQUEST_TIMEOUT_MS = 30_000;
 const ZERO_COST = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
 
 /** Model ids that are clearly not chat/completions models. */
-const NON_CHAT_ID = /(?:^openai-compatible-chat|(?:^|\/)no-think\/|embedding|rerank|transcri|\btts\b|\baudio\b|realtime|background-task|image|video|seedream|seedance|seededit|seed3d|hitem3d|hyper3d|happyhorse|(?:^|[-_/])(?:i2v|t2v|flf2v|r2v)(?:[-_/]|$))/i;
+const NON_CHAT_ID = /(?:^openai-compatible-chat|(?:^|\/)no-think\/|embedding|rerank|transcri|\btts\b|\baudio\b|realtime|background-task|gpt-image|agnes-image|agnes-video|seedream|seedance|seededit|seed3d|hitem3d|hyper3d|grok-imagine|happyhorse|(?:^|[-_/])(?:i2v|t2v|flf2v|r2v)(?:[-_/]|$)|gemini-[^/]*-image)/i;
 
 /** thinkingFormat values pi understands (see docs/models.md). */
 const PI_THINKING_FORMATS = new Set([
@@ -133,6 +133,58 @@ async function readJson<T>(path: string): Promise<T | undefined> {
   }
 }
 
+/** pi accepts // and /* *\/ comments in models.json; strip them without touching strings (URLs contain //). */
+export function stripJsonComments(text: string): string {
+  let out = "";
+  let inString = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    const next = text[i + 1];
+    if (inString) {
+      out += c;
+      if (c === "\\") out += text[++i] ?? "";
+      else if (c === '"') inString = false;
+    } else if (c === '"') {
+      inString = true;
+      out += c;
+    } else if (c === "/" && next === "/") {
+      while (i < text.length && text[i] !== "\n") i++;
+      out += "\n";
+    } else if (c === "/" && next === "*") {
+      i += 2;
+      while (i < text.length && !(text[i] === "*" && text[i + 1] === "/")) i++;
+      i++;
+    } else {
+      out += c;
+    }
+  }
+  return out;
+}
+
+/**
+ * Read models.json. A missing file is an empty config; an unparseable file is an
+ * error, so the caller never overwrites a config it could not read.
+ */
+export async function readModelsJson(path: string): Promise<{ providers?: Record<string, AnyRec> }> {
+  let text: string;
+  try {
+    text = await readFile(path, "utf8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return {};
+    throw error;
+  }
+  const parsed: unknown = JSON.parse(stripJsonComments(text.replace(/^\uFEFF/, "")));
+  if (!isRec(parsed)) throw new Error(`${path} is not a JSON object`);
+  return parsed;
+}
+
+/** Write via temp file + rename so a crash can never leave a truncated models.json. */
+async function writeFileAtomic(path: string, content: string): Promise<void> {
+  const tmp = `${path}.${process.pid}.tmp`;
+  await writeFile(tmp, content, { mode: 0o600 });
+  await rename(tmp, path);
+}
+
 // ---------------------------------------------------------------------------
 // config value resolution (same syntax as models.json: literal / $ENV / !cmd)
 // ---------------------------------------------------------------------------
@@ -206,10 +258,14 @@ function modelsEndpoint(baseUrl: string, api: string): string {
   return api === "anthropic-messages" ? `${url}?limit=1000` : url;
 }
 
-function requestHeaders(api: string, apiKey: string | undefined, extra: unknown): Record<string, string> {
+async function requestHeaders(api: string, apiKey: string | undefined, extra: unknown): Promise<Record<string, string>> {
   const headers: Record<string, string> = { Accept: "application/json" };
   if (isRec(extra)) {
-    for (const [key, value] of Object.entries(extra)) if (typeof value === "string") headers[key] = value;
+    // Header values use the same $ENV / !command syntax as apiKey.
+    for (const [key, value] of Object.entries(extra)) {
+      const resolved = typeof value === "string" ? await resolveConfigValue(value) : undefined;
+      if (resolved) headers[key] = resolved;
+    }
   }
   const hasAuth = Object.keys(headers).some((key) => /^(authorization|x-api-key|x-goog-api-key)$/i.test(key));
   if (apiKey && !hasAuth) {
@@ -228,7 +284,7 @@ function requestHeaders(api: string, apiKey: string | undefined, extra: unknown)
 async function fetchModelList(baseUrl: string, api: string, apiKey: string | undefined, extraHeaders: unknown): Promise<AnyRec[]> {
   const url = modelsEndpoint(baseUrl, api);
   const response = await fetch(url, {
-    headers: requestHeaders(api, apiKey, extraHeaders),
+    headers: await requestHeaders(api, apiKey, extraHeaders),
     signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
   });
   const text = await response.text();
@@ -282,7 +338,7 @@ interface UpstreamCapabilities {
   thinkingEffortSupported?: boolean;
 }
 
-function extractUpstream(raw: AnyRec): UpstreamCapabilities {
+export function extractUpstream(raw: AnyRec): UpstreamCapabilities {
   const caps = isRec(raw.capabilities) ? raw.capabilities : undefined;
   const params = Array.isArray(raw.supported_parameters)
     ? raw.supported_parameters.filter((value): value is string => typeof value === "string")
@@ -387,7 +443,11 @@ let modelsDevCache: { at: number; data: Record<string, ModelsDevModel> } | undef
 async function getModelsDevCatalog(signal?: AbortSignal): Promise<Record<string, ModelsDevModel>> {
   if (modelsDevCache && Date.now() - modelsDevCache.at < MODELS_DEV_TTL_MS) return modelsDevCache.data;
   try {
-    const response = await fetch(MODELS_DEV_URL, { signal, headers: { Accept: "application/json" } });
+    const timeout = AbortSignal.timeout(60_000);
+    const response = await fetch(MODELS_DEV_URL, {
+      signal: signal ? AbortSignal.any([signal, timeout]) : timeout,
+      headers: { Accept: "application/json" },
+    });
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const raw = (await response.json()) as Record<string, { models?: Record<string, ModelsDevModel> }>;
     const data: Record<string, ModelsDevModel> = {};
@@ -478,7 +538,7 @@ function lookupModelsDev(catalog: Record<string, ModelsDevModel>, id: string): M
  * - `{type:"toggle"}`: thinking is on/off, so hide the graded effort levels.
  * Any other shape (for example budget-only) leaves pi's defaults untouched.
  */
-function thinkingLevelMapFromDev(dev: ModelsDevModel | undefined): Record<string, string | null> | undefined {
+export function thinkingLevelMapFromDev(dev: ModelsDevModel | undefined): Record<string, string | null> | undefined {
   const options = dev?.reasoning_options;
   if (!Array.isArray(options) || options.length === 0) return undefined;
   const gradedLevels = ["minimal", "low", "medium", "high", "xhigh", "max"];
@@ -618,7 +678,7 @@ function buildModel(
   return model;
 }
 
-function isChatModel(raw: AnyRec, id: string): boolean {
+export function isChatModel(raw: AnyRec, id: string): boolean {
   if (NON_CHAT_ID.test(id)) return false;
   const mode = asStr(raw.mode);
   if (mode && !/^(chat|responses|completion|model)$/i.test(mode)) return false;
@@ -642,7 +702,7 @@ interface SyncResult {
 }
 
 async function syncModels(signal?: AbortSignal): Promise<SyncResult> {
-  const modelsJson = (await readJson<{ providers?: Record<string, AnyRec> }>(MODELS_JSON_PATH)) ?? {};
+  const modelsJson = await readModelsJson(MODELS_JSON_PATH); // throws on unreadable config -> nothing is written
   const auth = (await readJson<AnyRec>(AUTH_PATH)) ?? {};
   const catalog = await getModelsDevCatalog(signal);
 
@@ -688,7 +748,8 @@ async function syncModels(signal?: AbortSignal): Promise<SyncResult> {
     }
   }
 
-  await writeFile(MODELS_JSON_PATH, `${JSON.stringify({ providers }, null, 2)}\n`, { mode: 0o600 });
+  // ponytail: comments in models.json are dropped on rewrite (pi-web's Models panel does the same).
+  await writeFileAtomic(MODELS_JSON_PATH, `${JSON.stringify({ ...modelsJson, providers }, null, 2)}\n`);
   return { counts, errors, providers: synced, skipped };
 }
 
