@@ -597,7 +597,7 @@ function defaultGptThinkingLevelMap(id: string): Record<string, string | null> |
   };
 }
 
-function buildModel(
+export function buildModel(
   id: string,
   name: string | undefined,
   raw: AnyRec,
@@ -616,10 +616,17 @@ function buildModel(
     false,
   ) as boolean;
 
+  // Vision: an upstream `true` is trusted, but an upstream `false` is not —
+  // some gateways mislabel vision-capable routes as text-only (verified live:
+  // agnes/doubao routes answered image questions correctly while flagged
+  // vision=false). When models.dev says the model accepts images, believe it.
+  const devVision = includesImage(dev?.modalities?.input);
   const vision = pick(
     override?.vision,
+    upstream.vision === true ? true : undefined,
+    devVision === true ? true : undefined,
     upstream.vision,
-    includesImage(dev?.modalities?.input),
+    devVision,
     heuristic?.vision,
     false,
   ) as boolean;
@@ -754,21 +761,28 @@ async function syncModels(signal?: AbortSignal): Promise<SyncResult> {
 }
 
 export default function (pi: ExtensionAPI) {
+  const handler = async (_args: string, ctx: ExtensionCommandContext) => {
+    ctx.ui?.notify?.("Refreshing model catalogs…", "info");
+    try {
+      const result = await syncModels();
+      const summary = result.providers.map((name) => `${name} ${result.counts[name] ?? 0}`).join(", ") || "(none)";
+      if (result.errors.length > 0) {
+        ctx.ui?.notify?.(`Synced: ${summary}\nErrors:\n${result.errors.join("\n")}`, "warning");
+      } else {
+        ctx.ui?.notify?.(`models.json updated: ${summary}`, "info");
+      }
+    } catch (error) {
+      ctx.ui?.notify?.(`Sync failed: ${error instanceof Error ? error.message : String(error)}`, "error");
+    }
+  };
+
   pi.registerCommand("refresh-custom-models", {
     description: "Discover models for every models.json provider with a baseUrl and rewrite their model lists",
-    handler: async (_args, ctx) => {
-      ctx.ui.notify("Refreshing model catalogs…", "info");
-      try {
-        const result = await syncModels();
-        const summary = result.providers.map((name) => `${name} ${result.counts[name] ?? 0}`).join(", ") || "(none)";
-        if (result.errors.length > 0) {
-          ctx.ui.notify(`Synced: ${summary}\nErrors:\n${result.errors.join("\n")}`, "warning");
-        } else {
-          ctx.ui.notify(`models.json updated: ${summary}`, "info");
-        }
-      } catch (error) {
-        ctx.ui.notify(`Sync failed: ${error instanceof Error ? error.message : String(error)}`, "error");
-      }
-    },
+    handler,
+  });
+
+  pi.registerCommand("refresh-custom-provider-models", {
+    description: "Alias for /refresh-custom-models",
+    handler,
   });
 }

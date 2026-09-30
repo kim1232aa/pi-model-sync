@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import {
+  buildModel,
   extractUpstream,
   isChatModel,
   readModelsJson,
@@ -45,3 +46,22 @@ test("non-chat ids are filtered, vision chat models are not", () => {
   assert.equal(isChatModel({}, "qwen3-vl-image-understanding"), true);
   assert.equal(isChatModel({}, "kimi-k2-video-chat"), true);
 });
+
+test("vision resolution: upstream true kept, upstream false + models.dev true widened", () => {
+  // Case 1: upstream says true -> stays true even if dev is missing or false
+  const m1 = buildModel("m1", undefined, { capabilities: { vision: true } }, undefined, undefined);
+  assert.deepEqual(m1?.input, ["text", "image"]);
+
+  // Case 2: upstream says false, but models.dev says image input -> widened to true
+  const m2 = buildModel("m2", undefined, { capabilities: { vision: false } }, { modalities: { input: ["text", "image"] } }, undefined);
+  assert.deepEqual(m2?.input, ["text", "image"]);
+
+  // Case 3: upstream says false, models.dev says text only -> stays false
+  const m3 = buildModel("m3", undefined, { capabilities: { vision: false } }, { modalities: { input: ["text"] } }, undefined);
+  assert.deepEqual(m3?.input, ["text"]);
+
+  // Case 4: override wins unconditionally
+  const m4 = buildModel("m4", undefined, { capabilities: { vision: false } }, undefined, { vision: true });
+  assert.deepEqual(m4?.input, ["text", "image"]);
+});
+

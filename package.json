@@ -10,15 +10,17 @@
     "model-catalog"
   ],
   "license": "MIT",
+  "main": "index.ts",
   "pi": {
     "extensions": [
-      "./extensions"
+      "./index.ts"
     ]
   },
   "scripts": {
     "test": "node --experimental-strip-types --no-warnings --test test/model-sync.test.ts"
   },
   "files": [
+    "index.ts",
     "extensions",
     "README.md",
     "LICENSE"

@@ -24,6 +24,8 @@ Or copy `extensions/model-sync.ts` into `~/.pi/agent/extensions/`.
 /refresh-custom-models
 ```
 
+(The alias `/refresh-custom-provider-models` is also recognized).
+
 Works in both the pi CLI and the pi-web chat. Reload the session (`/reload`)
 after installing or changing the extension.
 
@@ -74,8 +76,11 @@ For each model, capabilities are resolved with this priority:
 4. a small gpt-5.x heuristic, an id-based reasoning hint, then defaults
 
 Because the upstream payload describes what *that endpoint actually serves*, it
-wins over models.dev for reasoning / vision / context window / max output when
-both are present.
+wins over models.dev for reasoning, context window, and max output when both
+are present. For vision specifically, an upstream `true` is trusted, but an
+upstream `false` is overridden when models.dev indicates the model supports
+image input (protecting against gateways that mislabel vision-capable routes as
+text-only).
 
 ### Thinking levels
 
