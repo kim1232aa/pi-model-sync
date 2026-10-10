@@ -847,6 +847,18 @@ export function buildModel(
   return model;
 }
 
+/** JSON with sorted keys, so reordered-but-equal objects do not count as changes. */
+export function stableStringify(value: unknown): string | undefined {
+  if (value === undefined) return undefined;
+  const sort = (v: unknown): unknown =>
+    Array.isArray(v)
+      ? v.map(sort)
+      : isRec(v)
+      ? Object.fromEntries(Object.keys(v).sort().map((k) => [k, sort(v[k])]))
+      : v;
+  return JSON.stringify(sort(value));
+}
+
 /** Non-destructively merge newly synced model capabilities with existing model properties. */
 export function mergeModelEntry(
   existing: AnyRec | undefined,
@@ -1132,6 +1144,17 @@ export async function syncModels(options: SyncOptions = {}): Promise<SyncResult>
           }
           if (JSON.stringify(existing.input) !== JSON.stringify(merged.input)) {
             changes.push(`input: ${JSON.stringify(existing.input)} -> ${JSON.stringify(merged.input)}`);
+          }
+          if (stableStringify(existing.thinkingLevelMap) !== stableStringify(merged.thinkingLevelMap)) {
+            changes.push(
+              `thinkingLevelMap: ${stableStringify(existing.thinkingLevelMap) ?? "none"} -> ${stableStringify(merged.thinkingLevelMap) ?? "none"}`,
+            );
+          }
+          if (stableStringify(existing.compat) !== stableStringify(merged.compat)) {
+            changes.push(`compat: ${stableStringify(existing.compat) ?? "none"} -> ${stableStringify(merged.compat) ?? "none"}`);
+          }
+          if (stableStringify(existing.cost) !== stableStringify(merged.cost)) {
+            changes.push("cost changed");
           }
           if (changes.length > 0) {
             updated += 1;

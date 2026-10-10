@@ -16,6 +16,7 @@ import {
   mergeModelEntry,
   pickDevRepresentative,
   readModelsJson,
+  stableStringify,
   stripJsonComments,
   syncModels,
   thinkingLevelMapFromDev,
@@ -333,5 +334,14 @@ test("dry-run and backup safety: simulates diff without disk modification, creat
   await assert.rejects(stat(bakPath));
 });
 
-
-
+test("stableStringify: ignores key order, distinguishes thinkingLevelMap changes", () => {
+  assert.equal(stableStringify(undefined), undefined);
+  assert.equal(
+    stableStringify({ low: "low", high: "high", xhigh: null }),
+    stableStringify({ xhigh: null, high: "high", low: "low" }),
+  );
+  assert.notEqual(
+    stableStringify({ high: "high", xhigh: null }),
+    stableStringify({ high: "high", xhigh: "xhigh" }),
+  );
+});
