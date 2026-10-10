@@ -39,7 +39,7 @@ const REQUEST_TIMEOUT_MS = 30_000;
 const ZERO_COST = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
 
 /** Model ids that are clearly not chat/completions models. */
-const NON_CHAT_ID = /(?:^openai-compatible-chat|(?:^|\/)no-think\/|embedding|rerank|transcri|\btts\b|\baudio\b|realtime|background-task|gpt-image|agnes-image|agnes-video|seedream|seedance|seededit|seed3d|hitem3d|hyper3d|grok-imagine|happyhorse|(?:^|[-_/])(?:i2v|t2v|flf2v|r2v)(?:[-_/]|$)|gemini-[^/]*-image)/i;
+const NON_CHAT_ID = /(?:^openai-compatible-chat|(?:^|\/)no-think\/|embedding|rerank|transcri|\btts\b|\baudio\b|realtime|background-task|gpt-image|agnes-image|agnes-video|seedream|seedance|seededit|seed3d|hitem3d|hyper3d|grok-imagine|happyhorse|(?:^|[-_/])(?:i2v|t2v|flf2v|r2v)(?:[-_/]|$)|gemini-(?:image|imagen)|imagen-)/i;
 
 /** thinkingFormat values pi understands (see docs/models.md). */
 const PI_THINKING_FORMATS = new Set([
@@ -505,30 +505,100 @@ function pickDevRepresentative(candidates: { providerId: string; model: ModelsDe
   });
   if (firstParty) return firstParty.model;
   if (candidates.length === 1) return candidates[0].model;
-  const groups = new Map<string, { count: number; model: ModelsDevModel }>();
-  for (const { model } of candidates) {
-    const key = JSON.stringify({
-      reasoning: model.reasoning,
-      reasoning_options: model.reasoning_options,
-      modalities: model.modalities,
-      limit: model.limit,
-    });
-    const group = groups.get(key) ?? { count: 0, model };
-    group.count += 1;
-    groups.set(key, group);
-  }
-  const sorted = [...groups.values()].sort((a, b) => b.count - a.count);
-  if (sorted[1] && sorted[1].count === sorted[0].count) return undefined;
+  // If no single first-party entry, sort by context window (prefer fuller specs)
+  // rather than discarding ties and returning undefined.
+  const sorted = [...candidates].sort((a, b) => {
+    const ctxA = asPos(a.model.limit?.context) ?? 0;
+    const ctxB = asPos(b.model.limit?.context) ?? 0;
+    return ctxB - ctxA;
+  });
   return sorted[0].model;
 }
 
-function lookupModelsDev(catalog: Record<string, ModelsDevModel>, id: string): ModelsDevModel | undefined {
-  const bare = id.includes("/") ? id.slice(id.lastIndexOf("/") + 1) : id;
-  const direct = catalog[id] ?? catalog[bare] ?? catalog[bare.toLowerCase()];
-  if (!direct) return undefined;
-  // Follow canonical_model_id to the first-party entry when available.
-  const canonical = asStr(direct.canonical_model_id);
-  return (canonical && catalog[canonical]) || direct;
+const BRACKET_TAG_RE = /\[[^\]]*\]/g;
+const TAG_SUFFIX_RE = /(?::(?:free|thinking|preview|default)|@[^/]+)$/i;
+const ROUTING_SUFFIX_RE = /-(?:openai-compact|compact|review|fast|wm|free)$/i;
+const VARIANT_SUFFIX_RE = /-(?:high|low|medium|tiered|extra-low|extra|thinking|agent)$/i;
+const ECO_PREFIX_RE = /^eco-/i;
+
+export function generateLookupCandidates(id: string): string[] {
+  const forms = new Set<string>([id]);
+
+  if (id.includes("[")) {
+    forms.add(id.replace(BRACKET_TAG_RE, ""));
+  }
+
+  if (id.includes("/")) {
+    const parts = id.split("/");
+    forms.add(parts[parts.length - 1]);
+    if (parts.length > 2) {
+      forms.add(parts.slice(1).join("/"));
+    }
+  }
+
+  const result: string[] = [];
+  const add = (c: string | undefined) => {
+    if (!c) return;
+    const clean = c.trim();
+    if (clean && !result.includes(clean)) result.push(clean);
+  };
+
+  for (const form of forms) {
+    add(form);
+    const noBracket = form.replace(BRACKET_TAG_RE, "");
+    add(noBracket);
+
+    const noTag = noBracket.replace(TAG_SUFFIX_RE, "");
+    add(noTag);
+
+    const noRouting = noTag.replace(ROUTING_SUFFIX_RE, "");
+    add(noRouting);
+
+    const noVariant = noRouting.replace(VARIANT_SUFFIX_RE, "");
+    add(noVariant);
+
+    const noEco = noVariant.replace(ECO_PREFIX_RE, "");
+    add(noEco);
+  }
+
+  for (const c of [...result]) {
+    const hyphenated = c.replace(/(\d+)\.(\d+)/g, "$1-$2");
+    add(hyphenated);
+    const dotted = c.replace(/(\d+)-(\d+)/g, "$1.$2");
+    add(dotted);
+  }
+
+  for (const c of [...result]) {
+    if (c.endsWith("-preview")) add(c.slice(0, -"-preview".length));
+    else add(`${c}-preview`);
+    if (c.endsWith("-latest")) add(c.slice(0, -"-latest".length));
+  }
+
+  return result;
+}
+
+export function lookupModelsDev(catalog: Record<string, ModelsDevModel>, id: string): ModelsDevModel | undefined {
+  const candidates = generateLookupCandidates(id);
+  for (const candidate of candidates) {
+    const direct = catalog[candidate] ?? catalog[candidate.toLowerCase()];
+    if (direct) {
+      const canonical = asStr(direct.canonical_model_id);
+      return (canonical && catalog[canonical]) || direct;
+    }
+  }
+  // Secondary fallback: if candidate has no slash, match any `${provider}/${candidate}`
+  for (const candidate of candidates) {
+    if (!candidate.includes("/")) {
+      const suffix = `/${candidate.toLowerCase()}`;
+      for (const [key, entry] of Object.entries(catalog)) {
+        if (key.toLowerCase().endsWith(suffix)) {
+          const canonical = asStr(entry.canonical_model_id);
+          return (canonical && catalog[canonical]) || entry;
+        }
+      }
+    }
+  }
+  return undefined;
 }
 
 /**
@@ -559,10 +629,10 @@ export function thinkingLevelMapFromDev(dev: ModelsDevModel | undefined): Record
 // model construction
 // ---------------------------------------------------------------------------
 
-/** Last-resort heuristic for gpt-5.x models served behind gateways that report nothing. */
+/** Last-resort heuristic for gpt-5.x / gpt-6.x models served behind gateways that report nothing. */
 function gptFallback(id: string): { contextWindow: number; maxTokens: number; reasoning: boolean; vision: boolean } | undefined {
   const root = id.includes("/") ? id.slice(id.lastIndexOf("/") + 1) : id;
-  const match = /^(gpt-5(?:\.\d+)?)/.exec(root);
+  const match = /^(gpt-[56](?:\.\d+)?)/.exec(root);
   if (!match) return undefined;
   const caps: Record<string, { contextWindow: number; maxTokens: number; reasoning: boolean; vision: boolean }> = {
     "gpt-5": { contextWindow: 400000, maxTokens: 128000, reasoning: false, vision: true },
@@ -572,6 +642,8 @@ function gptFallback(id: string): { contextWindow: number; maxTokens: number; re
     "gpt-5.4": { contextWindow: 1050000, maxTokens: 128000, reasoning: true, vision: true },
     "gpt-5.5": { contextWindow: 1050000, maxTokens: 128000, reasoning: true, vision: true },
     "gpt-5.6": { contextWindow: 1050000, maxTokens: 128000, reasoning: true, vision: true },
+    "gpt-6": { contextWindow: 1050000, maxTokens: 128000, reasoning: true, vision: true },
+    "gpt-6.1": { contextWindow: 1050000, maxTokens: 128000, reasoning: true, vision: true },
   };
   const key = Object.keys(caps).find((version) => root === version || root.startsWith(`${version}-`));
   if (!key) return undefined;
@@ -581,11 +653,11 @@ function gptFallback(id: string): { contextWindow: number; maxTokens: number; re
 
 /** Last-resort inference for gateways that expose no capability metadata. */
 function inferReasoningFromId(id: string): boolean | undefined {
-  return /(?:^|[-_/])(?:thinking|reasoning|reasoner|think)(?:[-_/]|\d|$)/i.test(id) ? true : undefined;
+  return /(?:^|[-_/])(?:thinking|reasoning|reasoner|think|high|medium|low|tiered|extra)(?:[-_/]|\d|$)/i.test(id) ? true : undefined;
 }
 
 function defaultGptThinkingLevelMap(id: string): Record<string, string | null> | undefined {
-  if (!/gpt-5/i.test(id)) return undefined;
+  if (!/gpt-[56]/i.test(id)) return undefined;
   return {
     off: "none",
     minimal: null,
@@ -593,7 +665,7 @@ function defaultGptThinkingLevelMap(id: string): Record<string, string | null> |
     medium: "medium",
     high: "high",
     xhigh: "xhigh",
-    max: /gpt-5\.6/i.test(id) ? "max" : null,
+    max: /gpt-(?:5\.6|6)/i.test(id) ? "max" : null,
   };
 }
 
@@ -607,14 +679,30 @@ export function buildModel(
   const upstream = extractUpstream(raw);
   const heuristic = gptFallback(id);
 
-  const reasoning = pick(
-    override?.reasoning,
-    upstream.reasoning,
-    dev?.reasoning,
-    heuristic?.reasoning,
-    inferReasoningFromId(id),
-    false,
-  ) as boolean;
+  // Reasoning capability resolution:
+  // 1. Explicit override wins unconditionally.
+  // 2. Any authoritative positive signal confirms reasoning:
+  //    upstream.reasoning === true, dev.reasoning === true,
+  //    heuristic.reasoning === true, or inferReasoningFromId(id) === true.
+  //    (Protects models like gpt-5.6-luna where gateways incorrectly report false).
+  // 3. Fall back to upstream false / dev false / default false.
+  let reasoning: boolean;
+  if (override?.reasoning !== undefined) {
+    reasoning = override.reasoning;
+  } else if (
+    upstream.reasoning === true ||
+    dev?.reasoning === true ||
+    heuristic?.reasoning === true ||
+    inferReasoningFromId(id) === true
+  ) {
+    reasoning = true;
+  } else if (upstream.reasoning === false) {
+    reasoning = false;
+  } else if (dev?.reasoning === false) {
+    reasoning = false;
+  } else {
+    reasoning = false;
+  }
 
   // Vision: an upstream `true` is trusted, but an upstream `false` is not —
   // some gateways mislabel vision-capable routes as text-only (verified live:
@@ -631,21 +719,24 @@ export function buildModel(
     false,
   ) as boolean;
 
-  const contextWindow = pick(
-    override?.contextWindow,
-    upstream.contextWindow,
-    asPos(dev?.limit?.context),
-    heuristic?.contextWindow,
-    128000,
-  ) as number;
+  // ContextWindow and MaxTokens:
+  // When an explicit override is provided, respect it unconditionally.
+  // Otherwise take the maximum between upstream, models.dev, and heuristics,
+  // preventing gateways from squashing official limits (e.g. 128k/8k placeholders
+  // or 500k relay caps on 1M/2M models).
+  const devContext = asPos(dev?.limit?.context);
+  const contextWindow = override?.contextWindow ?? (
+    upstream.contextWindow !== undefined || devContext !== undefined || heuristic?.contextWindow !== undefined
+      ? Math.max(upstream.contextWindow ?? 0, devContext ?? 0, heuristic?.contextWindow ?? 0)
+      : 128000
+  );
 
-  const maxTokens = pick(
-    override?.maxTokens,
-    upstream.maxTokens,
-    asPos(dev?.limit?.output),
-    heuristic?.maxTokens,
-    16384,
-  ) as number;
+  const devMaxTokens = asPos(dev?.limit?.output);
+  const maxTokens = override?.maxTokens ?? (
+    upstream.maxTokens !== undefined || devMaxTokens !== undefined || heuristic?.maxTokens !== undefined
+      ? Math.max(upstream.maxTokens ?? 0, devMaxTokens ?? 0, heuristic?.maxTokens ?? 0)
+      : 16384
+  );
 
   if (contextWindow <= 0 || maxTokens <= 0) return undefined;
 
@@ -661,8 +752,24 @@ export function buildModel(
     thinkingLevelMap.low = null;
     thinkingLevelMap.medium = null;
   }
-  if (upstream.reasoning === undefined && upstream.thinkingEffortSupported === undefined && !dev && heuristic) {
-    Object.assign(thinkingLevelMap, defaultGptThinkingLevelMap(id) ?? {});
+  if (reasoning && Object.keys(thinkingLevelMap).length === 0) {
+    const gptThinkingMap = defaultGptThinkingLevelMap(id);
+    if (gptThinkingMap) Object.assign(thinkingLevelMap, gptThinkingMap);
+  }
+
+  // Strong UI consistency invariant:
+  // If active reasoning tiers exist (e.g. low/high/max), the model MUST be reasoning-capable.
+  const hasActiveThinking = Object.entries(thinkingLevelMap).some(([k, v]) => k !== "off" && v !== null);
+  if (override?.reasoning === undefined && hasActiveThinking) {
+    reasoning = true;
+  }
+
+  // If reasoning is false, strip thinkingLevelMap completely to prevent UI mismatch
+  // (e.g. "Thinking Level: 6" shown while reasoning checkbox is unchecked).
+  if (!reasoning) {
+    for (const key of Object.keys(thinkingLevelMap)) {
+      delete thinkingLevelMap[key];
+    }
   }
 
   // compat.thinkingFormat: only when the upstream value is one pi understands.
@@ -698,6 +805,95 @@ export function isChatModel(raw: AnyRec, id: string): boolean {
 }
 
 // ---------------------------------------------------------------------------
+// custom provider eligibility & protection
+// ---------------------------------------------------------------------------
+
+export const BUILTIN_PROVIDERS = new Set<string>([
+  "amazon-bedrock",
+  "ant-ling",
+  "anthropic",
+  "azure-openai-responses",
+  "baseten",
+  "cerebras",
+  "cloudflare-ai-gateway",
+  "cloudflare-workers-ai",
+  "deepseek",
+  "fireworks",
+  "github-copilot",
+  "google",
+  "google-vertex",
+  "groq",
+  "huggingface",
+  "kimi-coding",
+  "meta",
+  "minimax",
+  "minimax-cn",
+  "mistral",
+  "moonshotai",
+  "moonshotai-cn",
+  "nvidia",
+  "openai",
+  "openai-codex",
+  "opencode",
+  "opencode-go",
+  "openrouter",
+  "qwen-token-plan",
+  "qwen-token-plan-cn",
+  "qwen-token-plan-individual",
+  "radius",
+  "together",
+  "vercel-ai-gateway",
+  "xai",
+  "xiaomi",
+  "xiaomi-token-plan-ams",
+  "xiaomi-token-plan-cn",
+  "xiaomi-token-plan-sgp",
+  "zai",
+  "zai-coding-cn",
+]);
+
+export interface ProviderEligibility {
+  eligible: boolean;
+  reason?: string;
+}
+
+export function isCustomProvider(
+  name: string,
+  provider: AnyRec,
+  auth?: AnyRec,
+): ProviderEligibility {
+  if (provider.sync === false) {
+    return { eligible: false, reason: "explicitly disabled (sync: false)" };
+  }
+  if (provider.sync === true) {
+    const baseUrl = asStr(provider.baseUrl);
+    if (!baseUrl) {
+      return { eligible: false, reason: "missing baseUrl" };
+    }
+    return { eligible: true };
+  }
+
+  const baseUrl = asStr(provider.baseUrl);
+  if (!baseUrl) {
+    return { eligible: false, reason: "missing baseUrl" };
+  }
+
+  if (Boolean(provider.oauth)) {
+    return { eligible: false, reason: "oauth provider" };
+  }
+  const cred = auth && isRec(auth[name]) ? auth[name] : undefined;
+  if (cred && (cred.type === "oauth" || cred.access_token || cred.refresh_token || cred.tokens)) {
+    return { eligible: false, reason: "oauth credential in auth.json" };
+  }
+
+  if (BUILTIN_PROVIDERS.has(name.toLowerCase())) {
+    return { eligible: false, reason: "built-in provider" };
+  }
+
+  return { eligible: true };
+}
+
+// ---------------------------------------------------------------------------
 // sync
 // ---------------------------------------------------------------------------
 
@@ -708,7 +904,7 @@ interface SyncResult {
   skipped: string[];
 }
 
-async function syncModels(signal?: AbortSignal): Promise<SyncResult> {
+export async function syncModels(signal?: AbortSignal): Promise<SyncResult> {
   const modelsJson = await readModelsJson(MODELS_JSON_PATH); // throws on unreadable config -> nothing is written
   const auth = (await readJson<AnyRec>(AUTH_PATH)) ?? {};
   const catalog = await getModelsDevCatalog(signal);
@@ -721,11 +917,12 @@ async function syncModels(signal?: AbortSignal): Promise<SyncResult> {
 
   for (const [name, provider] of Object.entries(providers)) {
     if (!isRec(provider)) continue;
-    const baseUrl = asStr(provider.baseUrl);
-    if (!baseUrl) {
-      skipped.push(name);
+    const { eligible, reason } = isCustomProvider(name, provider, auth);
+    if (!eligible) {
+      skipped.push(`${name}${reason ? ` (${reason})` : ""}`);
       continue;
     }
+    const baseUrl = asStr(provider.baseUrl)!;
     const api = asStr(provider.api) ?? "openai-completions";
     try {
       const apiKey = await resolveApiKey(provider, name, auth);
@@ -766,10 +963,11 @@ export default function (pi: ExtensionAPI) {
     try {
       const result = await syncModels();
       const summary = result.providers.map((name) => `${name} ${result.counts[name] ?? 0}`).join(", ") || "(none)";
+      const skippedSummary = result.skipped.length > 0 ? ` [Skipped: ${result.skipped.join(", ")}]` : "";
       if (result.errors.length > 0) {
-        ctx.ui?.notify?.(`Synced: ${summary}\nErrors:\n${result.errors.join("\n")}`, "warning");
+        ctx.ui?.notify?.(`Synced: ${summary}${skippedSummary}\nErrors:\n${result.errors.join("\n")}`, "warning");
       } else {
-        ctx.ui?.notify?.(`models.json updated: ${summary}`, "info");
+        ctx.ui?.notify?.(`models.json updated: ${summary}${skippedSummary}`, "info");
       }
     } catch (error) {
       ctx.ui?.notify?.(`Sync failed: ${error instanceof Error ? error.message : String(error)}`, "error");

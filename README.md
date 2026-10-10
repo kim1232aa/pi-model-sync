@@ -33,9 +33,18 @@ after installing or changing the extension.
 
 ### Which providers get synced
 
-Every provider in `models.json` that declares a **`baseUrl`** is synced. A
-provider without `baseUrl` (for example a `compat`-only override of a built-in
-provider) is left untouched.
+`pi-model-sync` is specifically designed for **custom providers** (third-party relays,
+aggregators, One API / New API, local Ollama / vLLM):
+
+1. **Custom providers with a `baseUrl`** are automatically discovered and synced.
+2. **Built-in official providers** (`anthropic`, `openai`, `github-copilot`, `google`, `deepseek`, etc.)
+   are **protected and skipped** by default, even if they have entries or base URLs in `models.json`.
+   Official models are managed by pi's core catalog and `pi update --models`.
+3. **OAuth providers** (declared with `oauth` or authenticated via OAuth credentials in `auth.json`)
+   are **automatically protected and skipped**.
+4. **Explicit control flags**:
+   - Set `"sync": false` on any provider in `models.json` to permanently skip syncing.
+   - Set `"sync": true` to explicitly force syncing a provider (e.g. a private self-hosted gateway named after an official provider).
 
 Only the provider's `models` array is replaced; `name`, `baseUrl`, `apiKey`,
 `headers`, `compat` and any other provider-level settings are preserved.
