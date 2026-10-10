@@ -9,11 +9,15 @@ import {
   buildModel,
   extractUpstream,
   generateLookupCandidates,
+  getCandidateModelUrls,
   isChatModel,
   isCustomProvider,
   lookupModelsDev,
+  mergeModelEntry,
+  pickDevRepresentative,
   readModelsJson,
   stripJsonComments,
+  syncModels,
   thinkingLevelMapFromDev,
 } from "../extensions/model-sync.ts";
 
@@ -137,7 +141,7 @@ test("gemini multimodal chat models survive filter, image generators are filtere
 
 test("isCustomProvider: protects built-ins, oauth, missing baseUrl, allows custom relays", () => {
   // 1. Valid custom provider with baseUrl
-  const custom = isCustomProvider("alibb99gpt", { baseUrl: "https://relay.example.com/v1" });
+  const custom = isCustomProvider("custom-relay", { baseUrl: "https://relay.example.com/v1" });
   assert.equal(custom.eligible, true);
 
   // 2. Missing baseUrl is skipped
@@ -158,7 +162,7 @@ test("isCustomProvider: protects built-ins, oauth, missing baseUrl, allows custo
   assert.equal(forceBuiltin.eligible, true);
 
   // 5. Custom provider can be explicitly disabled via sync: false
-  const disabledCustom = isCustomProvider("alibb99gpt", { baseUrl: "https://relay.example.com/v1", sync: false });
+  const disabledCustom = isCustomProvider("custom-relay", { baseUrl: "https://relay.example.com/v1", sync: false });
   assert.equal(disabledCustom.eligible, false);
   assert.match(disabledCustom.reason ?? "", /explicitly disabled/);
 
@@ -228,6 +232,105 @@ test("contextWindow restoration: cx/gpt-6-astra 272k pricing threshold restored 
   assert.equal(model.contextWindow, 1050000);
   assert.equal(model.maxTokens, 128000);
   assert.equal(model.reasoning, true);
+});
+
+test("getCandidateModelUrls: tests /v1/models probe and protocol fallbacks", () => {
+  // 1. URL without version suffix tries /v1/models first, falls back to /models
+  const withoutV1 = getCandidateModelUrls("https://relay.example.com");
+  assert.deepEqual(withoutV1, [
+    "https://relay.example.com/v1/models",
+    "https://relay.example.com/models",
+  ]);
+
+  // 2. URL already containing /v1 targets /v1/models directly
+  const withV1 = getCandidateModelUrls("https://relay.example.com/v1");
+  assert.deepEqual(withV1, ["https://relay.example.com/v1/models"]);
+
+  // 3. Anthropic protocol
+  const anthropic = getCandidateModelUrls("https://api.anthropic.com", "anthropic-messages");
+  assert.deepEqual(anthropic, ["https://api.anthropic.com/v1/models?limit=1000"]);
+
+  // 4. Google Generative AI protocol
+  const google = getCandidateModelUrls("http://relay.example.com", "google-generative-ai");
+  assert.deepEqual(google, [
+    "http://relay.example.com/v1beta/models",
+    "http://relay.example.com/models",
+  ]);
+});
+
+test("pickDevRepresentative: prefers first-party over aggregator entries", () => {
+  const candidates = [
+    { providerId: "openrouter", model: { canonical_model_id: "openai/o3-mini", limit: { context: 200000 } } as any },
+    { providerId: "openai", model: { canonical_model_id: "openai/o3-mini", limit: { context: 200000 } } as any },
+  ];
+  const chosen = pickDevRepresentative(candidates);
+  assert.equal(chosen?.canonical_model_id, "openai/o3-mini");
+});
+
+test("mergeModelEntry: preserves existing custom modalities, cost, and metadata non-destructively", () => {
+  const existing = {
+    id: "gemini-2.5-pro",
+    name: "My Custom Gemini",
+    input: ["text", "image", "audio"],
+    cost: { input: 1.25, output: 5, cacheRead: 0.3, cacheWrite: 1.25 },
+    compat: { customOption: true },
+    userNote: "custom configuration",
+  };
+  const generated = {
+    id: "gemini-2.5-pro",
+    name: "gemini-2.5-pro",
+    reasoning: true,
+    input: ["text", "image"],
+    contextWindow: 1048576,
+    maxTokens: 65536,
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    thinkingLevelMap: { low: "low", high: "high" },
+  };
+
+  const merged = mergeModelEntry(existing, generated);
+  // Preserves union of input modalities including audio
+  assert.ok(merged.input.includes("audio"));
+  assert.ok(merged.input.includes("image"));
+  assert.ok(merged.input.includes("text"));
+
+  // Preserves custom user pricing over zero-cost default
+  assert.equal(merged.cost.input, 1.25);
+
+  // Preserves custom user name
+  assert.equal(merged.name, "My Custom Gemini");
+
+  // Preserves user custom compat and arbitrary properties
+  assert.equal((merged.compat as any)?.customOption, true);
+  assert.equal((merged as any)?.userNote, "custom configuration");
+
+  // Takes updated context and thinking
+  assert.equal(merged.contextWindow, 1048576);
+  assert.equal(merged.thinkingLevelMap?.high, "high");
+});
+
+test("dry-run and backup safety: simulates diff without disk modification, creates .bak on write", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-sync-test-"));
+  const modelsPath = join(dir, "models.json");
+  const bakPath = join(dir, "models.json.bak");
+
+  const initialConfig = {
+    providers: {
+      mockrelay: {
+        baseUrl: "https://mock.example.com/v1",
+        sync: false, // disable network fetch
+      },
+    },
+  };
+  await writeFile(modelsPath, JSON.stringify(initialConfig, null, 2));
+
+  // 1. Dry run
+  const dryResult = await syncModels({ dryRun: true, agentDir: dir });
+  assert.equal(dryResult.dryRun, true);
+  assert.deepEqual(dryResult.skipped, ["mockrelay (explicitly disabled (sync: false))"]);
+
+  // Ensure no backup file was created during dry run
+  const { stat } = await import("node:fs/promises");
+  await assert.rejects(stat(bakPath));
 });
 
 

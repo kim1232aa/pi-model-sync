@@ -20,11 +20,31 @@ Or copy `extensions/model-sync.ts` into `~/.pi/agent/extensions/`.
 
 ## Usage
 
+### Slash Command (inside pi / pi-web)
+
 ```
-/refresh-custom-models
+/refresh-custom-models [--dry-run] [provider]
 ```
 
+- `/refresh-custom-models` — Syncs all custom providers in `models.json`.
+- `/refresh-custom-models --dry-run` — Preview model changes without modifying `models.json`.
+- `/refresh-custom-models custom-relay` — Sync only a specific provider.
+- `/refresh-custom-models custom-relay --dry-run` — Preview changes for a specific provider.
+
 (The alias `/refresh-custom-provider-models` is also recognized).
+
+### CLI Usage (Terminal)
+
+```bash
+# Preview changes without modifying files
+npx pi-model-sync --dry-run
+
+# Sync all custom providers (with automatic models.json.bak backup)
+npx pi-model-sync
+
+# Sync a specific provider
+npx pi-model-sync custom-relay
+```
 
 Works in both the pi CLI and the pi-web chat. Reload the session (`/reload`)
 after installing or changing the extension.
@@ -52,7 +72,23 @@ Only the provider's `models` array is replaced; `name`, `baseUrl`, `apiKey`,
 If a provider's model list cannot be fetched, that provider keeps its existing
 models and the command reports the error. Other providers still sync.
 
-### API key resolution
+### Candidate URL Probing & Fallback
+
+OpenAI-compatible relays vary in whether `baseUrl` includes `/v1`. `pi-model-sync` intelligently tests candidate endpoints:
+- If `baseUrl` has no version suffix (e.g. `https://my-relay.com`), it probes `${baseUrl}/v1/models` first.
+- If it encounters HTTP 404 or 405, it gracefully falls back to `${baseUrl}/models`.
+- If `baseUrl` already includes `/v1` or `/v1beta`, it targets that endpoint directly.
+
+### Non-Destructive Model Merging
+
+When updating existing models:
+- **Modality Union**: Custom modalities (e.g. `audio`) manually configured on existing models are preserved.
+- **Custom Pricing**: Existing user-configured pricing is retained if the upstream gateway does not report cost.
+- **Custom Metadata & Names**: Custom aliases, per-model `compat` overrides, and extra user keys are merged without data loss.
+
+### Automatic Backup Protection
+
+Before rewriting `models.json`, `pi-model-sync` automatically creates a byte-for-byte backup at `~/.pi/agent/models.json.bak`. During `--dry-run`, no backup or target file is modified.
 
 1. the provider's own `apiKey` — literal, `$ENV_VAR` / `${ENV_VAR}`, or `!command`
 2. pi's stored credentials (`~/.pi/agent/auth.json`, written by `/login`)

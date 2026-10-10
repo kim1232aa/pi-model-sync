@@ -3,7 +3,7 @@ import { readFile, rename, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 
 /**
  * Generic model catalog sync for pi / pi-web.
@@ -241,21 +241,28 @@ async function resolveApiKey(provider: AnyRec, providerName: string, auth: AnyRe
 }
 
 // ---------------------------------------------------------------------------
-// upstream endpoint
+// upstream endpoint & candidate discovery
 // ---------------------------------------------------------------------------
 
-function normalizeBaseUrl(baseUrl: string, api: string): string {
-  let url = baseUrl.replace(/\/+$/, "");
-  if (api === "anthropic-messages" && !/\/v\d+(?:beta)?$/i.test(url)) url += "/v1";
-  if (api === "google-generative-ai" && !/\/v\d+(?:beta)?$/i.test(url)) url += "/v1beta";
-  return url;
-}
+export function getCandidateModelUrls(baseUrl: string, api: string = "openai-completions"): string[] {
+  let clean = baseUrl.replace(/\/+$/, "");
+  if (api === "anthropic-messages") {
+    const base = /\/v\d+(?:beta)?$/i.test(clean) ? clean : `${clean}/v1`;
+    const url = /\/models$/i.test(base) ? base : `${base}/models`;
+    return [`${url}?limit=1000`];
+  }
+  if (api === "google-generative-ai") {
+    if (/\/models$/i.test(clean)) return [clean];
+    if (/\/v\d+(?:beta)?$/i.test(clean)) return [`${clean}/models`];
+    return [`${clean}/v1beta/models`, `${clean}/models`];
+  }
 
-function modelsEndpoint(baseUrl: string, api: string): string {
-  const base = normalizeBaseUrl(baseUrl, api);
-  const url = /\/models$/i.test(base) ? base : `${base}/models`;
-  // Anthropic defaults to a small page size; ask for a large one.
-  return api === "anthropic-messages" ? `${url}?limit=1000` : url;
+  // Generic OpenAI-compatible / default APIs
+  if (/\/models$/i.test(clean)) return [clean];
+  if (/\/v\d+(?:beta)?$/i.test(clean)) return [`${clean}/models`];
+
+  // When baseUrl lacks a version suffix like /v1, candidate 1 is /v1/models, candidate 2 is /models
+  return [`${clean}/v1/models`, `${clean}/models`];
 }
 
 async function requestHeaders(api: string, apiKey: string | undefined, extra: unknown): Promise<Record<string, string>> {
@@ -281,25 +288,47 @@ async function requestHeaders(api: string, apiKey: string | undefined, extra: un
   return headers;
 }
 
-async function fetchModelList(baseUrl: string, api: string, apiKey: string | undefined, extraHeaders: unknown): Promise<AnyRec[]> {
-  const url = modelsEndpoint(baseUrl, api);
-  const response = await fetch(url, {
-    headers: await requestHeaders(api, apiKey, extraHeaders),
-    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-  });
-  const text = await response.text();
-  if (!response.ok) {
-    throw new Error(`${url} returned HTTP ${response.status}${text ? `: ${text.slice(0, 200)}` : ""}`);
+async function fetchModelList(
+  baseUrl: string,
+  api: string,
+  apiKey: string | undefined,
+  extraHeaders: unknown,
+  signal?: AbortSignal,
+): Promise<AnyRec[]> {
+  const candidates = getCandidateModelUrls(baseUrl, api);
+  const headers = await requestHeaders(api, apiKey, extraHeaders);
+  let lastError: Error | null = null;
+
+  for (const url of candidates) {
+    try {
+      const response = await fetch(url, {
+        headers,
+        signal: signal ?? AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+      });
+      if (response.status === 404 || response.status === 405) {
+        lastError = new Error(`${url} returned HTTP ${response.status}`);
+        continue;
+      }
+      const text = await response.text();
+      if (!response.ok) {
+        throw new Error(`${url} returned HTTP ${response.status}${text ? `: ${text.slice(0, 200)}` : ""}`);
+      }
+      let payload: unknown;
+      try {
+        payload = JSON.parse(text);
+      } catch {
+        throw new Error(`${url} returned invalid JSON`);
+      }
+      const list = extractModelList(payload);
+      if (list.length === 0) throw new Error(`${url} returned no models`);
+      return list;
+    } catch (err) {
+      lastError = err instanceof Error ? err : new Error(String(err));
+      if (signal?.aborted) throw err;
+    }
   }
-  let payload: unknown;
-  try {
-    payload = JSON.parse(text);
-  } catch {
-    throw new Error(`${url} returned invalid JSON`);
-  }
-  const list = extractModelList(payload);
-  if (list.length === 0) throw new Error(`${url} returned no models`);
-  return list;
+
+  throw lastError || new Error(`Failed to fetch models from candidate endpoints: ${candidates.join(", ")}`);
 }
 
 function extractModelList(payload: unknown): AnyRec[] {
@@ -497,16 +526,33 @@ async function getModelsDevCatalog(signal?: AbortSignal): Promise<Record<string,
  * Prefer the first-party entry (provider named in canonical_model_id); otherwise
  * fall back to the most common capability shape.
  */
-function pickDevRepresentative(candidates: { providerId: string; model: ModelsDevModel }[]): ModelsDevModel | undefined {
+export function pickDevRepresentative(candidates: { providerId: string; model: ModelsDevModel }[]): ModelsDevModel | undefined {
   if (candidates.length === 0) return undefined;
+  const preferred = [
+    "openai",
+    "anthropic",
+    "google",
+    "deepseek",
+    "moonshot",
+    "zhipu",
+    "xai",
+    "mistral",
+    "meta",
+  ];
+  for (const p of preferred) {
+    const match = candidates.find(
+      (c) => c.providerId === p || c.model?.canonical_model_id?.startsWith(`${p}/`),
+    );
+    if (match) return match.model;
+  }
   const firstParty = candidates.find(({ providerId, model }) => {
     const canonical = asStr(model.canonical_model_id);
     return canonical !== undefined && canonical.split("/")[0] === providerId;
   });
   if (firstParty) return firstParty.model;
   if (candidates.length === 1) return candidates[0].model;
-  // If no single first-party entry, sort by context window (prefer fuller specs)
-  // rather than discarding ties and returning undefined.
+  const withCanonical = candidates.find((c) => Boolean(c.model?.canonical_model_id));
+  if (withCanonical) return withCanonical.model;
   const sorted = [...candidates].sort((a, b) => {
     const ctxA = asPos(a.model.limit?.context) ?? 0;
     const ctxB = asPos(b.model.limit?.context) ?? 0;
@@ -590,11 +636,20 @@ export function lookupModelsDev(catalog: Record<string, ModelsDevModel>, id: str
   for (const candidate of candidates) {
     if (!candidate.includes("/")) {
       const suffix = `/${candidate.toLowerCase()}`;
+      const matches: Array<{ providerId: string; model: ModelsDevModel }> = [];
       for (const [key, entry] of Object.entries(catalog)) {
         if (key.toLowerCase().endsWith(suffix)) {
+          const providerId = key.split("/")[0].toLowerCase();
           const canonical = asStr(entry.canonical_model_id);
-          return (canonical && catalog[canonical]) || entry;
+          matches.push({
+            providerId,
+            model: (canonical && catalog[canonical]) || entry,
+          });
         }
+      }
+      if (matches.length > 0) {
+        const representative = pickDevRepresentative(matches);
+        if (representative) return representative;
       }
     }
   }
@@ -792,6 +847,78 @@ export function buildModel(
   return model;
 }
 
+/** Non-destructively merge newly synced model capabilities with existing model properties. */
+export function mergeModelEntry(
+  existing: AnyRec | undefined,
+  generated: SyncedModel,
+): SyncedModel {
+  if (!existing || typeof existing !== "object") return generated;
+
+  // 1. Preserve and union input modalities
+  const inputSet = new Set<string>(generated.input || []);
+  if (Array.isArray(existing.input)) {
+    for (const item of existing.input) {
+      if (typeof item === "string") inputSet.add(item);
+    }
+  }
+
+  // 2. Preserve cost if generated is zero cost but existing had custom pricing
+  const isZeroCost = (c: any) =>
+    !c || (c.input === 0 && c.output === 0 && c.cacheRead === 0 && c.cacheWrite === 0);
+  const cost =
+    !isZeroCost(generated.cost)
+      ? generated.cost
+      : !isZeroCost(existing.cost)
+      ? existing.cost
+      : generated.cost;
+
+  // 3. Merge compat options
+  const compat = {
+    ...(isRec(existing.compat) ? existing.compat : {}),
+    ...(isRec(generated.compat) ? generated.compat : {}),
+  };
+
+  // 4. Merge thinkingLevelMap
+  const thinkingLevelMap = generated.thinkingLevelMap
+    ? {
+        ...(isRec(existing.thinkingLevelMap) ? existing.thinkingLevelMap : {}),
+        ...generated.thinkingLevelMap,
+      }
+    : undefined;
+
+  // 5. Shallow copy any extra custom user fields from existing
+  const merged: AnyRec = {
+    ...existing,
+    ...generated,
+    input: Array.from(inputSet),
+    cost,
+  };
+
+  // Preserve user custom name if previously customized
+  if (
+    typeof existing.name === "string" &&
+    existing.name.trim() &&
+    existing.name !== existing.id &&
+    generated.name === generated.id
+  ) {
+    merged.name = existing.name;
+  }
+
+  if (thinkingLevelMap && Object.keys(thinkingLevelMap).length > 0) {
+    merged.thinkingLevelMap = thinkingLevelMap;
+  } else {
+    delete merged.thinkingLevelMap;
+  }
+
+  if (Object.keys(compat).length > 0) {
+    merged.compat = compat;
+  } else {
+    delete merged.compat;
+  }
+
+  return merged as SyncedModel;
+}
+
 export function isChatModel(raw: AnyRec, id: string): boolean {
   if (NON_CHAT_ID.test(id)) return false;
   const mode = asStr(raw.mode);
@@ -897,25 +1024,58 @@ export function isCustomProvider(
 // sync
 // ---------------------------------------------------------------------------
 
-interface SyncResult {
+export interface SyncOptions {
+  dryRun?: boolean;
+  targetProviders?: string[];
+  signal?: AbortSignal;
+  agentDir?: string;
+}
+
+export interface ModelDiff {
+  id: string;
+  type: "added" | "updated" | "unchanged";
+  changes?: string[];
+}
+
+export interface ProviderDiff {
+  provider: string;
+  added: number;
+  updated: number;
+  unchanged: number;
+  details: ModelDiff[];
+}
+
+export interface SyncResult {
   counts: Record<string, number>;
   errors: string[];
   providers: string[];
   skipped: string[];
+  dryRun?: boolean;
+  diffs?: ProviderDiff[];
 }
 
-export async function syncModels(signal?: AbortSignal): Promise<SyncResult> {
-  const modelsJson = await readModelsJson(MODELS_JSON_PATH); // throws on unreadable config -> nothing is written
-  const auth = (await readJson<AnyRec>(AUTH_PATH)) ?? {};
-  const catalog = await getModelsDevCatalog(signal);
+export async function syncModels(options: SyncOptions = {}): Promise<SyncResult> {
+  const agentDir = options.agentDir ?? AGENT_DIR;
+  const modelsJsonPath = join(agentDir, "models.json");
+  const authPath = join(agentDir, "auth.json");
+
+  const modelsJson = await readModelsJson(modelsJsonPath); // throws on unreadable config -> nothing is written
+  const auth = (await readJson<AnyRec>(authPath)) ?? {};
+  const catalog = await getModelsDevCatalog(options.signal);
 
   const providers = { ...(modelsJson.providers ?? {}) };
   const counts: Record<string, number> = {};
   const errors: string[] = [];
   const synced: string[] = [];
   const skipped: string[] = [];
+  const diffs: ProviderDiff[] = [];
 
-  for (const [name, provider] of Object.entries(providers)) {
+  const targetNames = options.targetProviders && options.targetProviders.length > 0
+    ? options.targetProviders
+    : Object.keys(providers);
+
+  for (const name of targetNames) {
+    const provider = providers[name];
     if (!isRec(provider)) continue;
     const { eligible, reason } = isCustomProvider(name, provider, auth);
     if (!eligible) {
@@ -926,11 +1086,23 @@ export async function syncModels(signal?: AbortSignal): Promise<SyncResult> {
     const api = asStr(provider.api) ?? "openai-completions";
     try {
       const apiKey = await resolveApiKey(provider, name, auth);
-      const overrides = (await readJson<Record<string, ModelOverride>>(join(AGENT_DIR, `${name}-overrides.json`))) ?? {};
-      const rawList = await fetchModelList(baseUrl, api, apiKey, provider.headers);
+      const overrides = (await readJson<Record<string, ModelOverride>>(join(agentDir, `${name}-overrides.json`))) ?? {};
+      const rawList = await fetchModelList(baseUrl, api, apiKey, provider.headers, options.signal);
+
+      const existingMap = new Map<string, AnyRec>();
+      if (Array.isArray(provider.models)) {
+        for (const m of provider.models) {
+          if (m && typeof m.id === "string") existingMap.set(m.id, m);
+        }
+      }
 
       const seen = new Set<string>();
-      const models: SyncedModel[] = [];
+      const nextModels: SyncedModel[] = [];
+      const modelDiffs: ModelDiff[] = [];
+      let added = 0;
+      let updated = 0;
+      let unchanged = 0;
+
       for (const raw of rawList) {
         const entry = normalizeEntry(raw);
         if (!entry || seen.has(entry.id)) continue;
@@ -938,36 +1110,102 @@ export async function syncModels(signal?: AbortSignal): Promise<SyncResult> {
         const override = overrides[entry.id];
         if (override?.filter === true) continue;
         if (!isChatModel(raw, entry.id)) continue;
-        const model = buildModel(entry.id, entry.name, raw, lookupModelsDev(catalog, entry.id), override);
-        if (model) models.push(model);
+        const normalized = buildModel(entry.id, entry.name, raw, lookupModelsDev(catalog, entry.id), override);
+        if (!normalized) continue;
+
+        const existing = existingMap.get(entry.id);
+        const merged = mergeModelEntry(existing, normalized);
+
+        if (!existing) {
+          added += 1;
+          modelDiffs.push({ id: entry.id, type: "added" });
+        } else {
+          const changes: string[] = [];
+          if (existing.contextWindow !== merged.contextWindow) {
+            changes.push(`context: ${existing.contextWindow} -> ${merged.contextWindow}`);
+          }
+          if (existing.maxTokens !== merged.maxTokens) {
+            changes.push(`maxTokens: ${existing.maxTokens} -> ${merged.maxTokens}`);
+          }
+          if (existing.reasoning !== merged.reasoning) {
+            changes.push(`reasoning: ${existing.reasoning} -> ${merged.reasoning}`);
+          }
+          if (JSON.stringify(existing.input) !== JSON.stringify(merged.input)) {
+            changes.push(`input: ${JSON.stringify(existing.input)} -> ${JSON.stringify(merged.input)}`);
+          }
+          if (changes.length > 0) {
+            updated += 1;
+            modelDiffs.push({ id: entry.id, type: "updated", changes });
+          } else {
+            unchanged += 1;
+            modelDiffs.push({ id: entry.id, type: "unchanged" });
+          }
+        }
+        nextModels.push(merged);
       }
 
-      models.sort((a, b) => a.id.localeCompare(b.id));
-      providers[name] = { ...provider, models };
-      counts[name] = models.length;
+      nextModels.sort((a, b) => a.id.localeCompare(b.id));
+      providers[name] = { ...provider, models: nextModels };
+      counts[name] = nextModels.length;
       synced.push(name);
+      diffs.push({ provider: name, added, updated, unchanged, details: modelDiffs });
     } catch (error) {
       counts[name] = 0;
       errors.push(`${name}: ${error instanceof Error ? error.message : String(error)}`);
     }
   }
 
-  // ponytail: comments in models.json are dropped on rewrite (pi-web's Models panel does the same).
-  await writeFileAtomic(MODELS_JSON_PATH, `${JSON.stringify({ ...modelsJson, providers }, null, 2)}\n`);
-  return { counts, errors, providers: synced, skipped };
+  // Backup and write
+  if (!options.dryRun && synced.length > 0) {
+    try {
+      const currentRaw = await readFile(modelsJsonPath, "utf8");
+      await writeFileAtomic(`${modelsJsonPath}.bak`, currentRaw);
+    } catch {
+      // ignore missing models.json on backup
+    }
+    await writeFileAtomic(modelsJsonPath, `${JSON.stringify({ ...modelsJson, providers }, null, 2)}\n`);
+  }
+
+  return { counts, errors, providers: synced, skipped, dryRun: options.dryRun, diffs };
 }
 
 export default function (pi: ExtensionAPI) {
-  const handler = async (_args: string, ctx: ExtensionCommandContext) => {
-    ctx.ui?.notify?.("Refreshing model catalogs…", "info");
+  const handler = async (args: string, ctx: ExtensionCommandContext) => {
+    const isDryRun = /(?:^|\s)(?:--dry-run|-n|--preview)(?:\s|$)/i.test(args || "");
+    const targetProviders = (args || "")
+      .split(/\s+/)
+      .map((s) => s.trim())
+      .filter((s) => s && !s.startsWith("-"));
+
+    ctx.ui?.notify?.(
+      isDryRun ? "Simulating model catalog refresh (dry-run)…" : "Refreshing model catalogs…",
+      "info",
+    );
     try {
-      const result = await syncModels();
-      const summary = result.providers.map((name) => `${name} ${result.counts[name] ?? 0}`).join(", ") || "(none)";
+      const result = await syncModels({ dryRun: isDryRun, targetProviders });
+      const summary = result.providers
+        .map((name) => {
+          const diff = result.diffs?.find((d) => d.provider === name);
+          if (diff) {
+            return `${name}: ${result.counts[name] ?? 0} models (+${diff.added}, ~${diff.updated}, =${diff.unchanged})`;
+          }
+          return `${name} ${result.counts[name] ?? 0}`;
+        })
+        .join("; ") || "(none)";
       const skippedSummary = result.skipped.length > 0 ? ` [Skipped: ${result.skipped.join(", ")}]` : "";
+
       if (result.errors.length > 0) {
-        ctx.ui?.notify?.(`Synced: ${summary}${skippedSummary}\nErrors:\n${result.errors.join("\n")}`, "warning");
+        ctx.ui?.notify?.(
+          `${isDryRun ? "[Dry-run] " : ""}Synced: ${summary}${skippedSummary}\nErrors:\n${result.errors.join("\n")}`,
+          "warning",
+        );
       } else {
-        ctx.ui?.notify?.(`models.json updated: ${summary}${skippedSummary}`, "info");
+        ctx.ui?.notify?.(
+          isDryRun
+            ? `[Dry-run Preview] ${summary}${skippedSummary}\n(No files were modified)`
+            : `models.json updated: ${summary}${skippedSummary} (backup created)`,
+          "info",
+        );
       }
     } catch (error) {
       ctx.ui?.notify?.(`Sync failed: ${error instanceof Error ? error.message : String(error)}`, "error");
@@ -975,7 +1213,7 @@ export default function (pi: ExtensionAPI) {
   };
 
   pi.registerCommand("refresh-custom-models", {
-    description: "Discover models for every models.json provider with a baseUrl and rewrite their model lists",
+    description: "Discover models for custom providers in models.json (supports [provider] and --dry-run)",
     handler,
   });
 
