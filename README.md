@@ -118,7 +118,7 @@ For each model, capabilities are resolved with this priority:
    `top_provider`, …)
 3. the **models.dev catalog** (`https://models.dev/api.json`), matched by
    `provider/model`, bare model id, and `canonical_model_id`
-4. a small gpt-5.x heuristic, an id-based reasoning hint, then defaults
+4. plain defaults (128000 / 16384); capabilities are never guessed from the model id
 
 Because the upstream payload describes what *that endpoint actually serves*, it
 wins over models.dev for reasoning, context window, and max output when both

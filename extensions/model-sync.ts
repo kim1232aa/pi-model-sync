@@ -20,7 +20,7 @@ import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-c
  *   1. `<provider>-overrides.json` in the agent dir
  *   2. the upstream model list payload (many response shapes are understood)
  *   3. the models.dev catalog (matched by `provider/model` or bare model id)
- *   4. a small gpt-5.x heuristic and an id-based reasoning hint, then defaults
+ *   4. plain defaults (128000 / 16384) -- capabilities are never guessed from the model id
  *
  * Providers without `baseUrl` (for example a `compat`-only override of a
  * built-in provider) are never touched. Providers whose fetch fails keep their
@@ -39,7 +39,7 @@ const REQUEST_TIMEOUT_MS = 30_000;
 const ZERO_COST = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
 
 /** Model ids that are clearly not chat/completions models. */
-const NON_CHAT_ID = /(?:^openai-compatible-chat|(?:^|\/)no-think\/|embedding|rerank|transcri|\btts\b|\baudio\b|realtime|background-task|gpt-image|agnes-image|agnes-video|seedream|seedance|seededit|seed3d|hitem3d|hyper3d|grok-imagine|happyhorse|(?:^|[-_/])(?:i2v|t2v|flf2v|r2v)(?:[-_/]|$)|gemini-(?:image|imagen)|imagen-)/i;
+const NON_CHAT_ID = /(?:^openai-compatible-chat|(?:^|\/)no-think\/|embedding|rerank|transcri|\btts\b|\baudio\b|realtime|background-task|gpt-image|agnes-image|agnes-video|seedream|seedance|seededit|seed3d|hitem3d|hyper3d|grok-imagine|happyhorse|(?:^|[-_/])(?:i2v|t2v|flf2v|r2v)(?:[-_/]|$)|gemini-(?:image|imagen)|imagen-|(?:^|[-_/])(?:kling|sora|veo)(?:[-_/]|$)|(?:^|[-_/])(?:image|video)(?:-(?:preview|generation|gen|exp|\d[\w.]*))?$)/i;
 
 /** thinkingFormat values pi understands (see docs/models.md). */
 const PI_THINKING_FORMATS = new Set([
@@ -566,6 +566,8 @@ const TAG_SUFFIX_RE = /(?::(?:free|thinking|preview|default)|@[^/]+)$/i;
 const ROUTING_SUFFIX_RE = /-(?:openai-compact|compact|review|fast|wm|free)$/i;
 const VARIANT_SUFFIX_RE = /-(?:high|low|medium|tiered|extra-low|extra|thinking|agent)$/i;
 const ECO_PREFIX_RE = /^eco-/i;
+// trailing date snapshot: -250415, -20250415, -2025-04-15, -0613 (MMDD)
+const DATE_SNAPSHOT_RE = /-(?:(?:\d{2}|\d{4})(?:0[1-9]|1[0-2])(?:0[1-9]|[12]\d|3[01])|\d{4}-\d{2}-\d{2}|(?:0[1-9]|1[0-2])(?:0[1-9]|[12]\d|3[01]))$/;
 
 export function generateLookupCandidates(id: string): string[] {
   const forms = new Set<string>([id]);
@@ -600,11 +602,22 @@ export function generateLookupCandidates(id: string): string[] {
     const noRouting = noTag.replace(ROUTING_SUFFIX_RE, "");
     add(noRouting);
 
-    const noVariant = noRouting.replace(VARIANT_SUFFIX_RE, "");
+    // strip variants repeatedly ("-extra-low" -> "-extra" -> base)
+    let noVariant = noRouting;
+    for (let i = 0; i < 3; i++) {
+      const next = noVariant.replace(VARIANT_SUFFIX_RE, "");
+      if (next === noVariant) break;
+      noVariant = next;
+      add(noVariant);
+    }
     add(noVariant);
 
     const noEco = noVariant.replace(ECO_PREFIX_RE, "");
     add(noEco);
+  }
+
+  for (const c of [...result]) {
+    add(c.replace(DATE_SNAPSHOT_RE, ""));
   }
 
   for (const c of [...result]) {
@@ -684,46 +697,6 @@ export function thinkingLevelMapFromDev(dev: ModelsDevModel | undefined): Record
 // model construction
 // ---------------------------------------------------------------------------
 
-/** Last-resort heuristic for gpt-5.x / gpt-6.x models served behind gateways that report nothing. */
-function gptFallback(id: string): { contextWindow: number; maxTokens: number; reasoning: boolean; vision: boolean } | undefined {
-  const root = id.includes("/") ? id.slice(id.lastIndexOf("/") + 1) : id;
-  const match = /^(gpt-[56](?:\.\d+)?)/.exec(root);
-  if (!match) return undefined;
-  const caps: Record<string, { contextWindow: number; maxTokens: number; reasoning: boolean; vision: boolean }> = {
-    "gpt-5": { contextWindow: 400000, maxTokens: 128000, reasoning: false, vision: true },
-    "gpt-5.1": { contextWindow: 400000, maxTokens: 128000, reasoning: true, vision: true },
-    "gpt-5.2": { contextWindow: 400000, maxTokens: 128000, reasoning: true, vision: true },
-    "gpt-5.3": { contextWindow: 400000, maxTokens: 128000, reasoning: true, vision: true },
-    "gpt-5.4": { contextWindow: 1050000, maxTokens: 128000, reasoning: true, vision: true },
-    "gpt-5.5": { contextWindow: 1050000, maxTokens: 128000, reasoning: true, vision: true },
-    "gpt-5.6": { contextWindow: 1050000, maxTokens: 128000, reasoning: true, vision: true },
-    "gpt-6": { contextWindow: 1050000, maxTokens: 128000, reasoning: true, vision: true },
-    "gpt-6.1": { contextWindow: 1050000, maxTokens: 128000, reasoning: true, vision: true },
-  };
-  const key = Object.keys(caps).find((version) => root === version || root.startsWith(`${version}-`));
-  if (!key) return undefined;
-  if (root.includes("-chat-latest")) return { contextWindow: 128000, maxTokens: 16384, reasoning: true, vision: true };
-  return caps[key];
-}
-
-/** Last-resort inference for gateways that expose no capability metadata. */
-function inferReasoningFromId(id: string): boolean | undefined {
-  return /(?:^|[-_/])(?:thinking|reasoning|reasoner|think|high|medium|low|tiered|extra)(?:[-_/]|\d|$)/i.test(id) ? true : undefined;
-}
-
-function defaultGptThinkingLevelMap(id: string): Record<string, string | null> | undefined {
-  if (!/gpt-[56]/i.test(id)) return undefined;
-  return {
-    off: "none",
-    minimal: null,
-    low: "low",
-    medium: "medium",
-    high: "high",
-    xhigh: "xhigh",
-    max: /gpt-(?:5\.6|6)/i.test(id) ? "max" : null,
-  };
-}
-
 export function buildModel(
   id: string,
   name: string | undefined,
@@ -732,29 +705,16 @@ export function buildModel(
   override: ModelOverride | undefined,
 ): SyncedModel | undefined {
   const upstream = extractUpstream(raw);
-  const heuristic = gptFallback(id);
 
-  // Reasoning capability resolution:
+  // Reasoning capability resolution (never guessed from the id):
   // 1. Explicit override wins unconditionally.
-  // 2. Any authoritative positive signal confirms reasoning:
-  //    upstream.reasoning === true, dev.reasoning === true,
-  //    heuristic.reasoning === true, or inferReasoningFromId(id) === true.
-  //    (Protects models like gpt-5.6-luna where gateways incorrectly report false).
-  // 3. Fall back to upstream false / dev false / default false.
+  // 2. Any authoritative positive signal (upstream true, models.dev true) confirms reasoning.
+  // 3. Otherwise upstream false / models.dev false / default false.
   let reasoning: boolean;
   if (override?.reasoning !== undefined) {
     reasoning = override.reasoning;
-  } else if (
-    upstream.reasoning === true ||
-    dev?.reasoning === true ||
-    heuristic?.reasoning === true ||
-    inferReasoningFromId(id) === true
-  ) {
+  } else if (upstream.reasoning === true || dev?.reasoning === true) {
     reasoning = true;
-  } else if (upstream.reasoning === false) {
-    reasoning = false;
-  } else if (dev?.reasoning === false) {
-    reasoning = false;
   } else {
     reasoning = false;
   }
@@ -770,26 +730,25 @@ export function buildModel(
     devVision === true ? true : undefined,
     upstream.vision,
     devVision,
-    heuristic?.vision,
     false,
   ) as boolean;
 
   // ContextWindow and MaxTokens:
   // When an explicit override is provided, respect it unconditionally.
-  // Otherwise take the maximum between upstream, models.dev, and heuristics,
+  // Otherwise take the maximum between upstream and models.dev,
   // preventing gateways from squashing official limits (e.g. 128k/8k placeholders
   // or 500k relay caps on 1M/2M models).
   const devContext = asPos(dev?.limit?.context);
   const contextWindow = override?.contextWindow ?? (
-    upstream.contextWindow !== undefined || devContext !== undefined || heuristic?.contextWindow !== undefined
-      ? Math.max(upstream.contextWindow ?? 0, devContext ?? 0, heuristic?.contextWindow ?? 0)
+    upstream.contextWindow !== undefined || devContext !== undefined
+      ? Math.max(upstream.contextWindow ?? 0, devContext ?? 0)
       : 128000
   );
 
   const devMaxTokens = asPos(dev?.limit?.output);
   const maxTokens = override?.maxTokens ?? (
-    upstream.maxTokens !== undefined || devMaxTokens !== undefined || heuristic?.maxTokens !== undefined
-      ? Math.max(upstream.maxTokens ?? 0, devMaxTokens ?? 0, heuristic?.maxTokens ?? 0)
+    upstream.maxTokens !== undefined || devMaxTokens !== undefined
+      ? Math.max(upstream.maxTokens ?? 0, devMaxTokens ?? 0)
       : 16384
   );
 
@@ -807,11 +766,6 @@ export function buildModel(
     thinkingLevelMap.low = null;
     thinkingLevelMap.medium = null;
   }
-  if (reasoning && Object.keys(thinkingLevelMap).length === 0) {
-    const gptThinkingMap = defaultGptThinkingLevelMap(id);
-    if (gptThinkingMap) Object.assign(thinkingLevelMap, gptThinkingMap);
-  }
-
   // Strong UI consistency invariant:
   // If active reasoning tiers exist (e.g. low/high/max), the model MUST be reasoning-capable.
   const hasActiveThinking = Object.entries(thinkingLevelMap).some(([k, v]) => k !== "off" && v !== null);

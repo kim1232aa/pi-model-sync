@@ -122,20 +122,39 @@ test("contextWindow & maxTokens take Math.max to prevent placeholder squashing",
   );
   assert.equal(m?.contextWindow, 1000000);
   assert.equal(m?.maxTokens, 65536);
-  assert.equal(m?.reasoning, true);
+  // no reasoning signal from upstream or models.dev: the "-high" suffix is not evidence
+  assert.equal(m?.reasoning, false);
 });
 
-test("gpt-6 bare id heuristic fallback matches reasoning, vision, and 1M context", () => {
-  const m = buildModel("gpt-6", undefined, {}, undefined, undefined);
-  assert.equal(m?.contextWindow, 1050000);
-  assert.equal(m?.maxTokens, 128000);
+test("capabilities are never guessed from the model id", () => {
+  for (const id of ["gpt-6", "gpt-6-codex", "relay/eco-gpt-6", "relay/openai/gpt-5-2025-08-07", "claude-4-x", "kimi-k3", "gemini-9"]) {
+    const m = buildModel(id, undefined, {}, undefined, undefined);
+    assert.equal(m?.contextWindow, 128000, id);
+    assert.equal(m?.maxTokens, 16384, id);
+    assert.equal(m?.reasoning, false, id);
+    assert.deepEqual(m?.input, ["text"], id);
+    assert.equal(m?.thinkingLevelMap, undefined, id);
+  }
+  // "high"/"low"/"extra" in the id no longer implies reasoning
+  assert.equal(buildModel("some-model-high", undefined, {}, undefined, undefined)?.reasoning, false);
+  // explicit upstream signals are still honoured
+  const m = buildModel("x", undefined, { capabilities: { reasoning: true, vision: true } }, undefined, undefined);
   assert.equal(m?.reasoning, true);
   assert.deepEqual(m?.input, ["text", "image"]);
-  assert.equal(m?.thinkingLevelMap?.max, "max");
+  assert.equal(m?.thinkingLevelMap, undefined);
 });
 
-test("gemini multimodal chat models survive filter, image generators are filtered", () => {
-  assert.equal(isChatModel({}, "gemini-3.1-flash-image"), true);
+test("non-chat filter covers image / video generation ids but keeps multimodal chat models", () => {
+  for (const id of ["relay/kling/kling-video-o1", "relay/kling/kling-v3", "relay/gemini-3-pro-image", "sora-2", "veo-3"]) {
+    assert.equal(isChatModel({}, id), false, id);
+  }
+  for (const id of ["qwen3-vl-image-understanding", "kimi-k2-video-chat", "gpt-5.6-luna"]) {
+    assert.equal(isChatModel({}, id), true, id);
+  }
+});
+
+test("image generators are filtered", () => {
+  assert.equal(isChatModel({}, "gemini-3.1-flash-image"), false);
   assert.equal(isChatModel({}, "imagen-3.0-generate-002"), false);
   assert.equal(isChatModel({}, "gemini-image-preview"), false);
 });
@@ -177,35 +196,23 @@ test("isCustomProvider: protects built-ins, oauth, missing baseUrl, allows custo
   assert.match(oauthAuth.reason ?? "", /oauth credential/);
 });
 
-test("reasoning UI consistency: upstream false overridden by heuristic/dev, thinkingLevelMap synchronized", () => {
-  // Case A: gpt-5.6-luna where gateway incorrectly reports reasoning=false
-  const lunaRaw = {
-    id: "gpt-5.6-luna",
-    capabilities: {
-      vision: true,
-      reasoning: false, // gateway misreport
-      contextWindow: 1048576,
-      maxOutput: 524288,
-    },
-  };
+test("reasoning UI consistency: a reasoning=false gateway is not overridden by the id; thinkingLevelMap follows reasoning", () => {
+  // Gateway says reasoning=false and models.dev has nothing: honoured, no map.
+  const lunaRaw = { id: "gpt-5.6-luna", capabilities: { vision: true, reasoning: false, contextWindow: 1048576, maxOutput: 524288 } };
   const lunaModel = buildModel("gpt-5.6-luna", "gpt-5.6-luna", lunaRaw, undefined, undefined);
   assert.ok(lunaModel);
-  // Must be reasoning=true because gpt-5.6 is a known reasoning model
-  assert.equal(lunaModel.reasoning, true);
-  // Must have matching thinkingLevelMap with max tier for gpt-5.6
-  assert.ok(lunaModel.thinkingLevelMap);
-  assert.equal(lunaModel.thinkingLevelMap.max, "max");
+  assert.equal(lunaModel.reasoning, false);
+  assert.equal(lunaModel.thinkingLevelMap, undefined);
 
-  // Case B: Non-reasoning model must NEVER retain thinkingLevelMap
-  const gpt5Raw = {
-    id: "gpt-5",
-    capabilities: {
-      reasoning: false,
-      contextWindow: 400000,
-      maxOutput: 128000,
-    },
-  };
-  const gpt5Model = buildModel("gpt-5", "gpt-5", gpt5Raw, undefined, undefined);
+  // models.dev says reasoning with effort levels: gateway false is overridden and the map comes from models.dev.
+  const dev: ModelsDevModel = { id: "gpt-5.6-luna", reasoning: true, reasoning_options: [{ type: "effort", values: ["low", "high", "max"] }] } as ModelsDevModel;
+  const withDev = buildModel("gpt-5.6-luna", "gpt-5.6-luna", lunaRaw, dev, undefined);
+  assert.equal(withDev?.reasoning, true);
+  assert.equal(withDev?.thinkingLevelMap?.max, "max");
+  assert.equal(withDev?.thinkingLevelMap?.medium, null);
+
+  // Non-reasoning model must NEVER retain thinkingLevelMap
+  const gpt5Model = buildModel("gpt-5", "gpt-5", { id: "gpt-5", capabilities: { reasoning: false, contextWindow: 400000, maxOutput: 128000 } }, undefined, undefined);
   assert.ok(gpt5Model);
   assert.equal(gpt5Model.reasoning, false);
   assert.equal(gpt5Model.thinkingLevelMap, undefined);
@@ -229,7 +236,7 @@ test("contextWindow restoration: cx/gpt-6-astra 272k pricing threshold restored 
   };
   const model = buildModel("cx/gpt-6-astra", "cx/gpt-6-astra", rawGateway, devEntry, undefined);
   assert.ok(model);
-  // Must restore to 1050000 from devEntry / heuristic rather than 272000
+  // Must restore to 1050000 from devEntry rather than 272000
   assert.equal(model.contextWindow, 1050000);
   assert.equal(model.maxTokens, 128000);
   assert.equal(model.reasoning, true);
@@ -345,3 +352,12 @@ test("stableStringify: ignores key order, distinguishes thinkingLevelMap changes
     stableStringify({ high: "high", xhigh: "xhigh" }),
   );
 });
+
+test("generateLookupCandidates strips trailing date snapshots", () => {
+  const c = generateLookupCandidates("Relay-Plan/doubao-1-5-thinking-pro-250415");
+  assert.ok(c.includes("doubao-1-5-thinking-pro"));
+  assert.ok(c.includes("doubao-1.5-thinking-pro"));
+  assert.ok(generateLookupCandidates("gpt-5.4-2026-03-05").includes("gpt-5.4"));
+  assert.equal(generateLookupCandidates("qwen3-235b").includes("qwen3"), false);
+});
+
