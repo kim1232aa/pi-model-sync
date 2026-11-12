@@ -84,7 +84,7 @@ OpenAI-compatible relays vary in whether `baseUrl` includes `/v1`. `pi-model-syn
 When updating existing models:
 - **Modality Union**: Custom modalities (e.g. `audio`) manually configured on existing models are preserved.
 - **Custom Pricing**: Existing user-configured pricing is retained if the upstream gateway does not report cost.
-- **Custom Metadata & Names**: Custom aliases, per-model `compat` overrides, and extra user keys are merged without data loss.
+- **Custom Metadata & Names**: Existing custom aliases (a `name` different from the model `id`), per-model `compat` overrides, and extra user keys are merged without data loss. The sync itself never writes `name`.
 
 ### Automatic Backup Protection
 
@@ -172,8 +172,10 @@ Optional, `<provider>-overrides.json` next to `models.json`:
 - Writes are atomic (temp file + rename).
 - `headers` values support the same `$ENV` / `!command` syntax as `apiKey`.
 - `models.json` is strictly validated by pi. This extension only ever writes
-  fields pi knows (`id`, `name`, `reasoning`, `thinkingLevelMap`, `input`,
-  `cost`, `contextWindow`, `maxTokens`, `compat`).
+  fields pi knows (`id`, `reasoning`, `thinkingLevelMap`, `input`,
+  `cost`, `contextWindow`, `maxTokens`, `compat`). `name` is never generated;
+  a genuine user alias (`name !== id`) is preserved, while a redundant
+  `name === id` left by older versions is removed on sync.
 - A successful sync replaces the provider's model list, so models that no longer
   exist upstream are removed.
 - models.dev data is cached for 6 hours per process.

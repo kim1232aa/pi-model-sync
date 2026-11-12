@@ -58,19 +58,20 @@ test("non-chat ids are filtered, vision chat models are not", () => {
 
 test("vision resolution: upstream true kept, upstream false + models.dev true widened", () => {
   // Case 1: upstream says true -> stays true even if dev is missing or false
-  const m1 = buildModel("m1", undefined, { capabilities: { vision: true } }, undefined, undefined);
+  const m1 = buildModel("m1", { capabilities: { vision: true } }, undefined, undefined);
   assert.deepEqual(m1?.input, ["text", "image"]);
+  assert.equal("name" in (m1 as any), false);
 
   // Case 2: upstream says false, but models.dev says image input -> widened to true
-  const m2 = buildModel("m2", undefined, { capabilities: { vision: false } }, { modalities: { input: ["text", "image"] } }, undefined);
+  const m2 = buildModel("m2", { capabilities: { vision: false } }, { modalities: { input: ["text", "image"] } }, undefined);
   assert.deepEqual(m2?.input, ["text", "image"]);
 
   // Case 3: upstream says false, models.dev says text only -> stays false
-  const m3 = buildModel("m3", undefined, { capabilities: { vision: false } }, { modalities: { input: ["text"] } }, undefined);
+  const m3 = buildModel("m3", { capabilities: { vision: false } }, { modalities: { input: ["text"] } }, undefined);
   assert.deepEqual(m3?.input, ["text"]);
 
   // Case 4: override wins unconditionally
-  const m4 = buildModel("m4", undefined, { capabilities: { vision: false } }, undefined, { vision: true });
+  const m4 = buildModel("m4", { capabilities: { vision: false } }, undefined, { vision: true });
   assert.deepEqual(m4?.input, ["text", "image"]);
 });
 
@@ -115,7 +116,6 @@ test("contextWindow & maxTokens take Math.max to prevent placeholder squashing",
   // Upstream reports dummy 128k/8k, dev reports official 1M/64k -> Math.max picks 1M/64k
   const m = buildModel(
     "gemini-3.6-flash-high",
-    undefined,
     { inputTokenLimit: 128000, outputTokenLimit: 8192 },
     { limit: { context: 1000000, output: 65536 } } as any,
     undefined,
@@ -128,7 +128,7 @@ test("contextWindow & maxTokens take Math.max to prevent placeholder squashing",
 
 test("capabilities are never guessed from the model id", () => {
   for (const id of ["gpt-6", "gpt-6-codex", "relay/eco-gpt-6", "relay/openai/gpt-5-2025-08-07", "claude-4-x", "kimi-k3", "gemini-9"]) {
-    const m = buildModel(id, undefined, {}, undefined, undefined);
+    const m = buildModel(id, {}, undefined, undefined);
     assert.equal(m?.contextWindow, 128000, id);
     assert.equal(m?.maxTokens, 16384, id);
     assert.equal(m?.reasoning, false, id);
@@ -136,9 +136,9 @@ test("capabilities are never guessed from the model id", () => {
     assert.equal(m?.thinkingLevelMap, undefined, id);
   }
   // "high"/"low"/"extra" in the id no longer implies reasoning
-  assert.equal(buildModel("some-model-high", undefined, {}, undefined, undefined)?.reasoning, false);
+  assert.equal(buildModel("some-model-high", {}, undefined, undefined)?.reasoning, false);
   // explicit upstream signals are still honoured
-  const m = buildModel("x", undefined, { capabilities: { reasoning: true, vision: true } }, undefined, undefined);
+  const m = buildModel("x", { capabilities: { reasoning: true, vision: true } }, undefined, undefined);
   assert.equal(m?.reasoning, true);
   assert.deepEqual(m?.input, ["text", "image"]);
   assert.equal(m?.thinkingLevelMap, undefined);
@@ -199,20 +199,20 @@ test("isCustomProvider: protects built-ins, oauth, missing baseUrl, allows custo
 test("reasoning UI consistency: a reasoning=false gateway is not overridden by the id; thinkingLevelMap follows reasoning", () => {
   // Gateway says reasoning=false and models.dev has nothing: honoured, no map.
   const lunaRaw = { id: "gpt-5.6-luna", capabilities: { vision: true, reasoning: false, contextWindow: 1048576, maxOutput: 524288 } };
-  const lunaModel = buildModel("gpt-5.6-luna", "gpt-5.6-luna", lunaRaw, undefined, undefined);
+  const lunaModel = buildModel("gpt-5.6-luna", lunaRaw, undefined, undefined);
   assert.ok(lunaModel);
   assert.equal(lunaModel.reasoning, false);
   assert.equal(lunaModel.thinkingLevelMap, undefined);
 
   // models.dev says reasoning with effort levels: gateway false is overridden and the map comes from models.dev.
   const dev: ModelsDevModel = { id: "gpt-5.6-luna", reasoning: true, reasoning_options: [{ type: "effort", values: ["low", "high", "max"] }] } as ModelsDevModel;
-  const withDev = buildModel("gpt-5.6-luna", "gpt-5.6-luna", lunaRaw, dev, undefined);
+  const withDev = buildModel("gpt-5.6-luna", lunaRaw, dev, undefined);
   assert.equal(withDev?.reasoning, true);
   assert.equal(withDev?.thinkingLevelMap?.max, "max");
   assert.equal(withDev?.thinkingLevelMap?.medium, null);
 
   // Non-reasoning model must NEVER retain thinkingLevelMap
-  const gpt5Model = buildModel("gpt-5", "gpt-5", { id: "gpt-5", capabilities: { reasoning: false, contextWindow: 400000, maxOutput: 128000 } }, undefined, undefined);
+  const gpt5Model = buildModel("gpt-5", { id: "gpt-5", capabilities: { reasoning: false, contextWindow: 400000, maxOutput: 128000 } }, undefined, undefined);
   assert.ok(gpt5Model);
   assert.equal(gpt5Model.reasoning, false);
   assert.equal(gpt5Model.thinkingLevelMap, undefined);
@@ -234,7 +234,7 @@ test("contextWindow restoration: cx/gpt-6-astra 272k pricing threshold restored 
       vision: true,
     },
   };
-  const model = buildModel("cx/gpt-6-astra", "cx/gpt-6-astra", rawGateway, devEntry, undefined);
+  const model = buildModel("cx/gpt-6-astra", rawGateway, devEntry, undefined);
   assert.ok(model);
   // Must restore to 1050000 from devEntry rather than 272000
   assert.equal(model.contextWindow, 1050000);
@@ -286,7 +286,6 @@ test("mergeModelEntry: preserves existing custom modalities, cost, and metadata 
   };
   const generated = {
     id: "gemini-2.5-pro",
-    name: "gemini-2.5-pro",
     reasoning: true,
     input: ["text", "image"],
     contextWindow: 1048576,
@@ -306,6 +305,13 @@ test("mergeModelEntry: preserves existing custom modalities, cost, and metadata 
 
   // Preserves custom user name
   assert.equal(merged.name, "My Custom Gemini");
+
+  // A redundant auto-generated name (=== id) is dropped
+  const cleaned = mergeModelEntry(
+    { id: "plain-id", name: "plain-id" },
+    { id: "plain-id", reasoning: false, input: ["text"], contextWindow: 128000, maxTokens: 16384, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } },
+  );
+  assert.equal("name" in cleaned, false);
 
   // Preserves user custom compat and arbitrary properties
   assert.equal((merged.compat as any)?.customOption, true);
