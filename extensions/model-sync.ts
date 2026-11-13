@@ -462,6 +462,7 @@ interface ModelsDevModel {
   modalities?: { input?: string[]; output?: string[] };
   limit?: { context?: number; output?: number };
   canonical_model_id?: string;
+  temperature?: boolean;
 }
 
 let modelsDevCache: { at: number; data: Record<string, ModelsDevModel> } | undefined;
@@ -496,10 +497,18 @@ async function getModelsDevCatalog(signal?: AbortSignal): Promise<Record<string,
         data[`${providerId}/${id}`] = entry;
         const canonical = asStr(entry.canonical_model_id);
         // Prefer the first-party entry (the provider named in canonical_model_id).
-        if (canonical && (canonical.split("/")[0] === providerId || !data[canonical])) data[canonical] = entry;
-        push(bareCandidates, id, { providerId, model: entry });
-        const lower = id.toLowerCase();
-        if (lower !== id) push(bareLower, lower, { providerId, model: entry });
+        // Resellers often set canonical_model_id to lab/model; do not let them overwrite a
+        // first-party slot, and never index slash-containing ids as bare keys — that would
+        // clobber `anthropic/claude-*` with `llmgateway`'s `id: "anthropic/claude-*"`.
+        if (canonical) {
+          const isFirstParty = canonical.split("/")[0] === providerId;
+          if (isFirstParty || !data[canonical]) data[canonical] = entry;
+        }
+        if (!id.includes("/")) {
+          push(bareCandidates, id, { providerId, model: entry });
+          const lower = id.toLowerCase();
+          if (lower !== id) push(bareLower, lower, { providerId, model: entry });
+        }
       }
     }
     for (const [id, candidates] of bareCandidates) {
@@ -520,8 +529,9 @@ async function getModelsDevCatalog(signal?: AbortSignal): Promise<Record<string,
 
 /**
  * Pick one models.dev entry for a model id that appears under many providers.
- * Prefer the first-party entry (provider named in canonical_model_id); otherwise
- * fall back to the most common capability shape.
+ * Prefer a candidate whose providerId is a first-party lab. Aggregators that only
+ * *claim* a lab via canonical_model_id are not first-party — their reasoning_options
+ * are often incomplete (effort-only while the lab publishes toggle/budget_tokens).
  */
 export function pickDevRepresentative(candidates: { providerId: string; model: ModelsDevModel }[]): ModelsDevModel | undefined {
   if (candidates.length === 0) return undefined;
@@ -537,9 +547,7 @@ export function pickDevRepresentative(candidates: { providerId: string; model: M
     "meta",
   ];
   for (const p of preferred) {
-    const match = candidates.find(
-      (c) => c.providerId === p || c.model?.canonical_model_id?.startsWith(`${p}/`),
-    );
+    const match = candidates.find((c) => c.providerId === p);
     if (match) return match.model;
   }
   const firstParty = candidates.find(({ providerId, model }) => {
@@ -666,25 +674,46 @@ export function lookupModelsDev(catalog: Record<string, ModelsDevModel>, id: str
   return undefined;
 }
 
+function reasoningOptionsShape(dev: ModelsDevModel | undefined): {
+  hasEffort: boolean;
+  hasToggle: boolean;
+  hasBudget: boolean;
+  values: string[];
+} {
+  const options = dev?.reasoning_options;
+  if (!Array.isArray(options) || options.length === 0) {
+    return { hasEffort: false, hasToggle: false, hasBudget: false, values: [] };
+  }
+  const effort = options.find((option) => isRec(option) && option.type === "effort" && Array.isArray(option.values));
+  const values = (effort?.values ?? []).filter((value): value is string => typeof value === "string");
+  return {
+    hasEffort: values.length > 0,
+    hasToggle: options.some((option) => isRec(option) && option.type === "toggle"),
+    hasBudget: options.some((option) => isRec(option) && option.type === "budget_tokens"),
+    values,
+  };
+}
+
 /**
  * Translate models.dev `reasoning_options` into pi's `thinkingLevelMap`.
  *
  * - `{type:"effort", values:[...]}`: keep only the pi levels the model exposes.
+ * - Effort-only (no `toggle`, no `budget_tokens`, values do not include `none`):
+ *   thinking cannot be turned off, so `off` is `null`. Pi then omits `thinking`
+ *   instead of sending `{type:"disabled"}`.
  * - `{type:"toggle"}`: thinking is on/off, so hide the graded effort levels.
  * Any other shape (for example budget-only) leaves pi's defaults untouched.
  */
 export function thinkingLevelMapFromDev(dev: ModelsDevModel | undefined): Record<string, string | null> | undefined {
-  const options = dev?.reasoning_options;
-  if (!Array.isArray(options) || options.length === 0) return undefined;
-  const gradedLevels = ["minimal", "low", "medium", "high", "xhigh", "max"];
-  const effort = options.find((option) => isRec(option) && option.type === "effort" && Array.isArray(option.values));
-  const values = (effort?.values ?? []).filter((value): value is string => typeof value === "string");
-  if (values.length > 0) {
+  const { hasEffort, hasToggle, hasBudget, values } = reasoningOptionsShape(dev);
+  if (hasEffort) {
+    const gradedLevels = ["minimal", "low", "medium", "high", "xhigh", "max"];
     const map: Record<string, string | null> = {};
     for (const level of gradedLevels) map[level] = values.includes(level) ? level : null;
+    if (!hasToggle && !hasBudget && !values.includes("none")) map.off = null;
     return map;
   }
-  if (options.some((option) => isRec(option) && option.type === "toggle")) {
+  if (hasToggle) {
     return { minimal: null, low: null, medium: null };
   }
   return undefined;
@@ -699,6 +728,7 @@ export function buildModel(
   raw: AnyRec,
   dev: ModelsDevModel | undefined,
   override: ModelOverride | undefined,
+  api?: string,
 ): SyncedModel | undefined {
   const upstream = extractUpstream(raw);
 
@@ -781,6 +811,19 @@ export function buildModel(
   const compat: AnyRec = {};
   if (upstream.thinkingFormat && PI_THINKING_FORMATS.has(upstream.thinkingFormat) && upstream.thinkingFormat !== "openai") {
     compat.thinkingFormat = upstream.thinkingFormat;
+  }
+
+  // Anthropic Messages adaptive-thinking models reject `{type:"disabled"}` and
+  // `{type:"enabled", budget_tokens}`. Drive the wire format from models.dev,
+  // never from the model id. These keys are invalid on other APIs.
+  if (api === "anthropic-messages" && reasoning) {
+    const shape = reasoningOptionsShape(dev);
+    if (shape.hasEffort && !shape.hasBudget) {
+      compat.forceAdaptiveThinking = true;
+    }
+    if (dev?.temperature === false) {
+      compat.supportsTemperature = false;
+    }
   }
 
   const model: SyncedModel = {
@@ -1067,7 +1110,7 @@ export async function syncModels(options: SyncOptions = {}): Promise<SyncResult>
         const override = overrides[entry.id];
         if (override?.filter === true) continue;
         if (!isChatModel(raw, entry.id)) continue;
-        const normalized = buildModel(entry.id, raw, lookupModelsDev(catalog, entry.id), override);
+        const normalized = buildModel(entry.id, raw, lookupModelsDev(catalog, entry.id), override, api);
         if (!normalized) continue;
 
         const existing = existingMap.get(entry.id);

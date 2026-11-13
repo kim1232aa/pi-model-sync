@@ -43,10 +43,26 @@ test("upstream capabilities: explicit false wins, camelCase + snake_case shapes"
 
 test("models.dev reasoning_options -> thinkingLevelMap", () => {
   assert.deepEqual(thinkingLevelMapFromDev({ reasoning_options: [{ type: "effort", values: ["low", "high", "max"] }] }), {
-    minimal: null, low: "low", medium: null, high: "high", xhigh: null, max: "max",
+    off: null, minimal: null, low: "low", medium: null, high: "high", xhigh: null, max: "max",
   });
   assert.deepEqual(thinkingLevelMapFromDev({ reasoning_options: [{ type: "toggle" }] }), { minimal: null, low: null, medium: null });
   assert.equal(thinkingLevelMapFromDev({ reasoning_options: [] }), undefined);
+  // toggle or budget_tokens means thinking can be turned off; do not hide `off`.
+  const withToggle = thinkingLevelMapFromDev({
+    reasoning_options: [{ type: "toggle" }, { type: "effort", values: ["low", "medium", "high", "xhigh", "max"] }],
+  });
+  assert.equal(withToggle?.low, "low");
+  assert.equal("off" in (withToggle ?? {}), false);
+  const withBudget = thinkingLevelMapFromDev({
+    reasoning_options: [{ type: "effort", values: ["low", "medium", "high"] }, { type: "budget_tokens", min: 1024, max: 32000 }],
+  });
+  assert.equal(withBudget?.high, "high");
+  assert.equal("off" in (withBudget ?? {}), false);
+  const withNone = thinkingLevelMapFromDev({
+    reasoning_options: [{ type: "effort", values: ["none", "low", "medium", "high"] }],
+  });
+  assert.equal(withNone?.low, "low");
+  assert.equal("off" in (withNone ?? {}), false);
 });
 
 test("non-chat ids are filtered, vision chat models are not", () => {
@@ -210,6 +226,8 @@ test("reasoning UI consistency: a reasoning=false gateway is not overridden by t
   assert.equal(withDev?.reasoning, true);
   assert.equal(withDev?.thinkingLevelMap?.max, "max");
   assert.equal(withDev?.thinkingLevelMap?.medium, null);
+  assert.equal(withDev?.thinkingLevelMap?.off, null);
+  assert.equal(withDev?.compat, undefined);
 
   // Non-reasoning model must NEVER retain thinkingLevelMap
   const gpt5Model = buildModel("gpt-5", { id: "gpt-5", capabilities: { reasoning: false, contextWindow: 400000, maxOutput: 128000 } }, undefined, undefined);
@@ -273,6 +291,37 @@ test("pickDevRepresentative: prefers first-party over aggregator entries", () =>
   ];
   const chosen = pickDevRepresentative(candidates);
   assert.equal(chosen?.canonical_model_id, "openai/o3-mini");
+  assert.equal(chosen, candidates[1].model);
+});
+
+test("pickDevRepresentative: aggregator claiming anthropic/ canonical is not first-party", () => {
+  const haikuFirstParty = {
+    id: "claude-haiku-4-5",
+    reasoning: true,
+    reasoning_options: [{ type: "budget_tokens", min: 1024, max: 64000 }],
+  };
+  const haikuAggregator = {
+    id: "claude-haiku-4-5",
+    canonical_model_id: "anthropic/claude-haiku-4-5",
+    reasoning: true,
+    reasoning_options: [{ type: "effort", values: ["low", "medium", "high", "xhigh", "max"] }],
+  };
+  const chosen = pickDevRepresentative([
+    { providerId: "cortecs", model: haikuAggregator as any },
+    { providerId: "anthropic", model: haikuFirstParty as any },
+  ]);
+  assert.equal(chosen, haikuFirstParty);
+  // First-party Haiku 4.5 is budget-tokens only: thinking can be disabled, no adaptive force.
+  assert.equal(thinkingLevelMapFromDev(chosen), undefined);
+  const built = buildModel(
+    "claude-haiku-4-5",
+    { capabilities: { reasoning: true } },
+    chosen,
+    undefined,
+    "anthropic-messages",
+  );
+  assert.equal(built?.thinkingLevelMap, undefined);
+  assert.equal(built?.compat?.forceAdaptiveThinking, undefined);
 });
 
 test("mergeModelEntry: preserves existing custom modalities, cost, and metadata non-destructively", () => {
@@ -365,5 +414,84 @@ test("generateLookupCandidates strips trailing date snapshots", () => {
   assert.ok(c.includes("doubao-1.5-thinking-pro"));
   assert.ok(generateLookupCandidates("gpt-5.4-2026-03-05").includes("gpt-5.4"));
   assert.equal(generateLookupCandidates("qwen3-235b").includes("qwen3"), false);
+});
+
+test("anthropic-messages effort-only models get off:null and adaptive compat", () => {
+  const opusDev = {
+    id: "claude-opus-5-5",
+    reasoning: true,
+    temperature: false,
+    reasoning_options: [{ type: "effort", values: ["low", "medium", "high", "xhigh", "max"] }],
+    modalities: { input: ["text", "image"] },
+    limit: { context: 1000000, output: 128000 },
+  };
+  const m = buildModel(
+    "claude-opus-5-5",
+    { capabilities: { reasoning: true, vision: true } },
+    opusDev,
+    undefined,
+    "anthropic-messages",
+  );
+  assert.ok(m);
+  assert.equal(m.thinkingLevelMap?.off, null);
+  assert.equal(m.thinkingLevelMap?.low, "low");
+  assert.equal(m.thinkingLevelMap?.max, "max");
+  assert.equal(m.compat?.forceAdaptiveThinking, true);
+  assert.equal(m.compat?.supportsTemperature, false);
+});
+
+test("openai-completions does not receive anthropic adaptive compat keys", () => {
+  const lunaDev = {
+    id: "gpt-5.6-luna",
+    reasoning: true,
+    temperature: false,
+    reasoning_options: [{ type: "effort", values: ["low", "high", "max"] }],
+  };
+  const m = buildModel(
+    "gpt-5.6-luna",
+    { capabilities: { reasoning: true } },
+    lunaDev,
+    undefined,
+    "openai-completions",
+  );
+  assert.ok(m);
+  assert.equal(m.thinkingLevelMap?.off, null);
+  assert.equal(m.compat, undefined);
+});
+
+test("anthropic-messages models with toggle or budget_tokens stay disable-able", () => {
+  const withToggle = buildModel(
+    "claude-sonnet-5",
+    { capabilities: { reasoning: true } },
+    {
+      reasoning: true,
+      temperature: false,
+      reasoning_options: [
+        { type: "toggle" },
+        { type: "effort", values: ["low", "medium", "high", "xhigh", "max"] },
+      ],
+    },
+    undefined,
+    "anthropic-messages",
+  );
+  assert.equal(withToggle?.thinkingLevelMap?.off, undefined);
+  assert.equal(withToggle?.compat?.forceAdaptiveThinking, true);
+  assert.equal(withToggle?.compat?.supportsTemperature, false);
+
+  const withBudget = buildModel(
+    "claude-opus-4-6",
+    { capabilities: { reasoning: true } },
+    {
+      reasoning: true,
+      reasoning_options: [
+        { type: "effort", values: ["low", "medium", "high"] },
+        { type: "budget_tokens", min: 1024, max: 32000 },
+      ],
+    },
+    undefined,
+    "anthropic-messages",
+  );
+  assert.equal(withBudget?.thinkingLevelMap?.off, undefined);
+  assert.equal(withBudget?.compat?.forceAdaptiveThinking, undefined);
 });
 

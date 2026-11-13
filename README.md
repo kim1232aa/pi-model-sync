@@ -117,7 +117,12 @@ For each model, capabilities are resolved with this priority:
    `input_cost_per_token`, OpenRouter's `architecture` / `pricing` /
    `top_provider`, …)
 3. the **models.dev catalog** (`https://models.dev/api.json`), matched by
-   `provider/model`, bare model id, and `canonical_model_id`
+   `provider/model`, bare model id, and `canonical_model_id`. When several
+   providers list the same model, the first-party lab (`providerId ===
+   anthropic` / `openai` / …) is used — aggregators that only *claim* a lab
+   via `canonical_model_id` are ignored, because their `reasoning_options`
+   are often incomplete. Reseller ids that already contain a slash are not
+   indexed as bare keys, so they cannot overwrite `anthropic/claude-*`.
 4. plain defaults (128000 / 16384); capabilities are never guessed from the model id
 
 Because the upstream payload describes what *that endpoint actually serves*, it
@@ -133,6 +138,10 @@ text-only).
 
 - `{"type":"effort","values":[…]}` → only the levels the model exposes are kept
   (for example `["low","high","max"]` hides `minimal`, `medium` and `xhigh`).
+- Effort-only (no `toggle`, no `budget_tokens`, and `values` does not include
+  `none`) → thinking cannot be turned off, so `off` is set to `null`. Pi then
+  omits the `thinking` field instead of sending `{type:"disabled"}` (required
+  by always-on adaptive models such as Claude Opus 5.5).
 - `{"type":"toggle"}` → thinking is on/off, so the graded effort levels are hidden.
 - a budget-only model leaves pi's defaults alone.
 
@@ -140,6 +149,12 @@ When models.dev has no `reasoning_options` for a model, the upstream
 `thinkingCanDisable` / `thinkingEffortSupported` fields are used instead.
 `thinkingFormat` is mapped into `compat.thinkingFormat` when it is a value pi
 understands.
+
+On `anthropic-messages` providers, an effort-without-budget models.dev entry
+also sets `compat.forceAdaptiveThinking` so Pi sends `thinking.type: adaptive`
+plus `output_config.effort` instead of the older `budget_tokens` payload.
+`dev.temperature === false` maps to `compat.supportsTemperature: false`.
+These Anthropic-only keys are never written for other APIs.
 
 ### Filtering
 
